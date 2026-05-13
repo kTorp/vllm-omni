@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-
 import torch
 from vllm import envs
 from vllm.config import VllmConfig
@@ -52,13 +50,6 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     """
 
     _omni_enum = OmniPlatformEnum.ROCM
-
-    @classmethod
-    def configure_diffusion_environment_defaults(cls) -> None:
-        # ROCm skinny GEMM kernels (wvSplitK/wvSplitKrc) only support
-        # LLM-typical matrix shapes and fail on the small N dimensions
-        # common in diffusion transformers (e.g. proj_out with N=64).
-        os.environ.setdefault("VLLM_ROCM_USE_SKINNY_GEMM", "0")
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
