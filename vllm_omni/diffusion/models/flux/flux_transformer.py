@@ -271,6 +271,8 @@ class FluxAttention(torch.nn.Module):
                     joint_strategy="front",
                 )
                 hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                # Text tokens stay replicated in this SP path, so there is no
+                # separate text-side padding mask to attach here.
                 encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
                 if hidden_states_mask is not None:
                     attn_metadata.attn_mask = hidden_states_mask
@@ -345,6 +347,8 @@ class FluxAttention(torch.nn.Module):
                     joint_strategy="front",
                 )
                 hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                # Text tokens stay replicated in this SP path, so there is no
+                # separate text-side padding mask to attach here.
                 encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
                 if hidden_states_mask is not None:
                     attn_metadata.attn_mask = hidden_states_mask
@@ -619,10 +623,14 @@ class FluxRopePrepare(nn.Module):
         components (0 & 1) need to be replicated across SP ranks,
         while image components (2 & 3) must be sharded.
         """
-        # NPU requires computation on CPU then transfer back
+        # NPU requires computation on CPU then transfer back. Keep a
+        # single pos_embed call to avoid an extra CPU round-trip.
         if is_torch_npu_available() and img_ids.device.type == "npu":
-            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids.cpu())
-            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids.cpu())
+            txt_len = txt_ids.shape[0]
+            ids = torch.cat((txt_ids, img_ids), dim=0).cpu()
+            freqs_cos, freqs_sin = self.pos_embed(ids)
+            txt_freqs_cos, img_freqs_cos = freqs_cos.split((txt_len, img_ids.shape[0]), dim=0)
+            txt_freqs_sin, img_freqs_sin = freqs_sin.split((txt_len, img_ids.shape[0]), dim=0)
             return (
                 txt_freqs_cos.npu(),
                 txt_freqs_sin.npu(),
@@ -723,7 +731,7 @@ class FluxTransformer2DModel(nn.Module):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
 
-        self.pos_embed = FluxPosEmbed(theta=theta, axes_dim=list(axes_dims_rope))
+        self.pos_embed = FluxPosEmbed(theta=theta, axes_dim=axes_dims_rope)
         self.rope_prepare = FluxRopePrepare(self.pos_embed)
         text_time_guidance_cls = (
             CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
