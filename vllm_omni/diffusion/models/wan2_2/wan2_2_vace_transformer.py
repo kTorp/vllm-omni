@@ -217,6 +217,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         hidden_states_mask = None
         ctx = get_forward_context()
         parallel_config = ctx.omni_diffusion_config.parallel_config
+        sp_size = parallel_config.sequence_parallel_size if parallel_config is not None else 1
         if (
             parallel_config is not None
             and parallel_config.mask_sp_padding
