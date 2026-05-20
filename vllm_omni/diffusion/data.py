@@ -172,10 +172,6 @@ class DiffusionParallelConfig:
         return self
 
     def __post_init__(self) -> None:
-        if not self.mask_sp_padding:
-            if os.environ.get("DIFFUSION_SP_MASK_PADDING", "").lower() in ("1", "true"):
-                self.mask_sp_padding = True
-
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
 
