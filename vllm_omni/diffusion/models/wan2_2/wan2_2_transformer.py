@@ -407,6 +407,8 @@ class WanSelfAttention(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
+        self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+
         # Unified attention layer
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -442,7 +444,6 @@ class WanSelfAttention(nn.Module):
 
         # Apply rotary embeddings
         if rotary_emb is not None:
-            self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
             freqs_cos, freqs_sin = rotary_emb
             query = self.rotary_embedding(query, freqs_cos, freqs_sin)
             key = self.rotary_embedding(key, freqs_cos, freqs_sin)
