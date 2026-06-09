@@ -214,12 +214,16 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         # Shard hidden_states via _sp_plan hook (before VACE, not at blocks.0)
         hidden_states = self._sp_shard_point(hidden_states)
 
-        # SP state and attention mask for padding
         hidden_states_mask = None
         ctx = get_forward_context()
         parallel_config = ctx.omni_diffusion_config.parallel_config
         sp_size = parallel_config.sequence_parallel_size if parallel_config is not None else 1
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            parallel_config is not None
+            and parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
