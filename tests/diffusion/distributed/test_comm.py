@@ -297,6 +297,85 @@ def _test_5d_identity_worker(
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len_per_rank", [8])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("head_size", [32])
+def test_combined_qkv_equivalence(
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+):
+    """Test that 1x SeqAllToAll5D on stacked QKV == 3x SeqAllToAll4D on separate Q, K, V."""
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
+    if num_heads % world_size != 0:
+        pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
+
+    torch.multiprocessing.spawn(
+        _test_combined_qkv_equivalence_worker,
+        args=(world_size, dtype, batch_size, seq_len_per_rank, num_heads, head_size),
+        nprocs=world_size,
+    )
+
+
+def _test_combined_qkv_equivalence_worker(
+    local_rank: int,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+):
+    """Worker: verify combined 5D path produces identical results to three separate 4D calls."""
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
+
+    update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "29502",
+        }
+    )
+
+    init_distributed_environment()
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
+
+    torch.manual_seed(42 + local_rank)
+    shape = (batch_size, seq_len_per_rank, num_heads, head_size)
+    query = torch.randn(shape, dtype=dtype, device=device)
+    key = torch.randn(shape, dtype=dtype, device=device)
+    value = torch.randn(shape, dtype=dtype, device=device)
+
+    # Path A: 3x separate SeqAllToAll4D
+    q4 = SeqAllToAll4D.apply(sp_group, query.clone(), 2, 1, False)
+    k4 = SeqAllToAll4D.apply(sp_group, key.clone(), 2, 1, False)
+    v4 = SeqAllToAll4D.apply(sp_group, value.clone(), 2, 1, False)
+
+    # Path B: 1x combined SeqAllToAll5D
+    qkv = torch.stack([query, key, value], dim=2)  # (B, S/P, 3, H, D)
+    qkv = SeqAllToAll5D.apply(sp_group, qkv, 3, 1, False)  # (B, S, 3, H/P, D)
+    q5, k5, v5 = qkv.unbind(dim=2)
+
+    torch.testing.assert_close(q4, q5, rtol=1e-5, atol=1e-5, msg="Query mismatch: 4D vs 5D combined")
+    torch.testing.assert_close(k4, k5, rtol=1e-5, atol=1e-5, msg="Key mismatch: 4D vs 5D combined")
+    torch.testing.assert_close(v4, v5, rtol=1e-5, atol=1e-5, msg="Value mismatch: 4D vs 5D combined")
+
+    destroy_distributed_env()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [128])
 def test_ring_p2p(
