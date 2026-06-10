@@ -7,6 +7,18 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Inductor passes that reorder compute and communication to overlap collectives
+# (e.g. tensor-parallel all-reduces) with compute. Opt-in per model via the
+# ``_reorder_compute_comm_overlap`` class attribute.
+COMPUTE_COMM_OVERLAP_INDUCTOR_OPTIONS = {
+    "reorder_for_compute_comm_overlap": True,
+    "reorder_for_compute_comm_overlap_passes": [
+        "sink_waits",
+        "raise_comms",
+        "reorder_compute_for_overlap",
+    ],
+}
+
 
 def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: Any) -> nn.Module:
     """
@@ -26,6 +38,12 @@ def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: A
     if not repeated_blocks:
         logger.warning("Regional compilation skipped because the model does not define `_repeated_blocks`.")
         return model
+
+    # Opt-in: merge compute/comm overlap reordering inductor options for models
+    # that request it (preserving any caller-supplied options).
+    if getattr(model, "_reorder_compute_comm_overlap", False):
+        options = {**(compile_kwargs.get("options") or {}), **COMPUTE_COMM_OVERLAP_INDUCTOR_OPTIONS}
+        compile_kwargs["options"] = options
 
     # Check if we have modules with the specified class names
     has_compiled_region = False
