@@ -928,7 +928,7 @@ class Flux2Transformer2DModel(nn.Module):
         if sp_size and sp_size > 1 and is_forward_context_available():
             fwd_ctx = get_forward_context()
             split_text_embed_in_sp = (num_txt_tokens % sp_size == 0) and fwd_ctx.sp_padding_size == 0
-            fwd_ctx.split_text_embed_in_sp = split_text_embed_in_sp            
+            fwd_ctx.split_text_embed_in_sp = split_text_embed_in_sp
 
         if split_text_embed_in_sp:
             encoder_hidden_states = sp_shard(encoder_hidden_states, dim=1, validate=False)
