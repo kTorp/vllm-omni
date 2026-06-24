@@ -3,6 +3,7 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+import inspect
 import logging
 
 # test if flash_attn (FA2) is available
@@ -59,11 +60,17 @@ except Exception as e:
     HAS_FLASHINFER = False
     logger.warning("FlashInfer is unavailable; falling back to other attention backends. Reason: %s", e)
 
+# See utils/fa.py for the integer mapping (0=RTNE, 1=RTNA, 2=RTZ).
+# On gfx950 (MI355X) there are no rtna/rtz kernel binaries; aiter falls back to
+# RTNE transparently, so passing 2 on that architecture is safe.
+AITER_HOW_V3_BF16_CVT = None
 try:
     import aiter  # noqa: F401
     from aiter import flash_attn_func as flash_attn_func_aiter  # noqa: F401
 
     HAS_AITER = True
+    if inspect.signature(flash_attn_func_aiter).parameters.get("how_v3_bf16_cvt") is not None:
+        AITER_HOW_V3_BF16_CVT = 2
 except (ImportError, ModuleNotFoundError):
     HAS_AITER = False
 

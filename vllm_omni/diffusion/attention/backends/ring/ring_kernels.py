@@ -7,6 +7,7 @@ import math
 import torch
 
 from .ring_globals import (
+    AITER_HOW_V3_BF16_CVT,
     HAS_AITER,
     HAS_FA3,
     HAS_FLASH_ATTN,
@@ -203,10 +204,7 @@ def flash_attn_forward_aiter(
     return_softmax=False,
 ):
     assert HAS_AITER, "Aiter is not available"
-    block_out, block_lse = flash_attn_func_aiter(
-        q,
-        k,
-        v,
+    fa_kwargs = dict(
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -214,7 +212,9 @@ def flash_attn_forward_aiter(
         alibi_slopes=alibi_slopes,
         return_lse=True,
     )
-
+    if AITER_HOW_V3_BF16_CVT is not None:
+        fa_kwargs["how_v3_bf16_cvt"] = AITER_HOW_V3_BF16_CVT
+    block_out, block_lse = flash_attn_func_aiter(q, k, v, **fa_kwargs)
     return block_out, block_lse
 
 
