@@ -204,17 +204,21 @@ def flash_attn_forward_aiter(
     return_softmax=False,
 ):
     assert HAS_AITER, "Aiter is not available"
-    fa_kwargs = dict(
+    fa_kwargs = {}
+    if AITER_HOW_V3_BF16_CVT is not None:
+        fa_kwargs["how_v3_bf16_cvt"] = AITER_HOW_V3_BF16_CVT
+    block_out, block_lse = flash_attn_func_aiter(
+        q,
+        k,
+        v,
         dropout_p=dropout_p,
         softmax_scale=softmax_scale,
         causal=causal,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         return_lse=True,
+        **fa_kwargs,
     )
-    if AITER_HOW_V3_BF16_CVT is not None:
-        fa_kwargs["how_v3_bf16_cvt"] = AITER_HOW_V3_BF16_CVT
-    block_out, block_lse = flash_attn_func_aiter(q, k, v, **fa_kwargs)
     return block_out, block_lse
 
 
