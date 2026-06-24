@@ -164,6 +164,7 @@ In `DiffusionParallelConfig`:
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
+| `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
 - Total sequence parallel size equals to `ulysses_degree × ring_degree`
