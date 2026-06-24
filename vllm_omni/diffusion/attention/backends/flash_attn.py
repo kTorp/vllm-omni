@@ -169,6 +169,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            AITER_HOW_V3_BF16_CVT,
             HAS_FLASH_ATTN,
             flash_attn_func,
         )
@@ -182,6 +183,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        fa_kwargs = {}
+        if AITER_HOW_V3_BF16_CVT is not None:
+            fa_kwargs["how_v3_bf16_cvt"] = AITER_HOW_V3_BF16_CVT
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -215,6 +220,7 @@ class FlashAttentionImpl(AttentionImpl):
                 value,
                 causal=self.causal,
                 softmax_scale=self.softmax_scale,
+                **fa_kwargs,
             )
             return self._unwrap_flash_output(out)
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+import inspect
 from functools import lru_cache
 
 import torch
@@ -26,6 +27,8 @@ logger = init_logger(__name__)
 flash_attn_func = None
 flash_attn_varlen_func = None
 
+AITER_HOW_V3_BF16_CVT = None
+
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
     try:
@@ -33,6 +36,8 @@ if current_omni_platform.is_rocm():
 
         if is_aiter_found_and_supported():
             from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+            if inspect.signature(flash_attn_func).parameters.get("how_v3_bf16_cvt") is not None:
+                AITER_HOW_V3_BF16_CVT = 2
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():
