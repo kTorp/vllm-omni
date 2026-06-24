@@ -60,9 +60,6 @@ except Exception as e:
     HAS_FLASHINFER = False
     logger.warning("FlashInfer is unavailable; falling back to other attention backends. Reason: %s", e)
 
-# See utils/fa.py for the integer mapping (0=RTNE, 1=RTNA, 2=RTZ).
-# On gfx950 (MI355X) there are no rtna/rtz kernel binaries; aiter falls back to
-# RTNE transparently, so passing 2 on that architecture is safe.
 AITER_HOW_V3_BF16_CVT = None
 try:
     import aiter  # noqa: F401
