@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 logger = init_logger(__name__)
 
@@ -169,6 +170,7 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_AITER_FLASH_ATTN,
             HAS_FLASH_ATTN,
             flash_attn_func,
         )
@@ -182,6 +184,12 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        fa_kwargs = {}
+        if HAS_AITER_FLASH_ATTN:
+            config = get_current_diffusion_config_or_none()
+            mode = config.aiter_bf16_cvt_mode if config is not None else 2  # 2 = round to zero
+            fa_kwargs["how_v3_bf16_cvt"] = mode
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -215,6 +223,7 @@ class FlashAttentionImpl(AttentionImpl):
                 value,
                 causal=self.causal,
                 softmax_scale=self.softmax_scale,
+                **fa_kwargs,
             )
             return self._unwrap_flash_output(out)
 
