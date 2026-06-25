@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from .ring_globals import (
     HAS_AITER,
     HAS_FA3,
@@ -203,6 +204,10 @@ def flash_attn_forward_aiter(
     return_softmax=False,
 ):
     assert HAS_AITER, "Aiter is not available"
+    config = get_current_diffusion_config_or_none()
+    fa_kwargs = {
+        "how_v3_bf16_cvt": config.aiter_bf16_cvt_mode if config is not None else 2  # 2 = round to zero
+    }
     block_out, block_lse = flash_attn_func_aiter(
         q,
         k,
@@ -213,8 +218,8 @@ def flash_attn_forward_aiter(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         return_lse=True,
+        **fa_kwargs,
     )
-
     return block_out, block_lse
 
 
