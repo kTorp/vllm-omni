@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
-import inspect
 from functools import lru_cache
 
 import torch
@@ -27,7 +26,13 @@ logger = init_logger(__name__)
 flash_attn_func = None
 flash_attn_varlen_func = None
 
-AITER_HOW_V3_BF16_CVT = None
+# True when flash_attn_func is provided by aiter (ROCm only).
+# The BF16 conversion mode is controlled by parallel_config.aiter_bf16_cvt_mode:
+#   0 = RTNE (round to nearest even, IEEE default)
+#   1 = RTNA (round to nearest away, aiter API default)
+#   2 = RTZ  (round to zero / truncate) — vllm-omni default
+# On gfx950 (MI355X) the kernel falls back to RTNE regardless of the setting.
+HAS_AITER_FLASH_ATTN = False
 
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
@@ -36,8 +41,7 @@ if current_omni_platform.is_rocm():
 
         if is_aiter_found_and_supported():
             from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
-            if inspect.signature(flash_attn_func).parameters.get("how_v3_bf16_cvt") is not None:
-                AITER_HOW_V3_BF16_CVT = 2
+            HAS_AITER_FLASH_ATTN = True
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():

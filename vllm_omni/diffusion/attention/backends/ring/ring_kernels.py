@@ -6,8 +6,8 @@ import math
 
 import torch
 
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from .ring_globals import (
-    AITER_HOW_V3_BF16_CVT,
     HAS_AITER,
     HAS_FA3,
     HAS_FLASH_ATTN,
@@ -204,9 +204,10 @@ def flash_attn_forward_aiter(
     return_softmax=False,
 ):
     assert HAS_AITER, "Aiter is not available"
-    fa_kwargs = {}
-    if AITER_HOW_V3_BF16_CVT is not None:
-        fa_kwargs["how_v3_bf16_cvt"] = AITER_HOW_V3_BF16_CVT
+    config = get_current_diffusion_config_or_none()
+    fa_kwargs = {
+        "how_v3_bf16_cvt": config.aiter_bf16_cvt_mode if config is not None else 2  # 2 = round to zero
+    }
     block_out, block_lse = flash_attn_func_aiter(
         q,
         k,
