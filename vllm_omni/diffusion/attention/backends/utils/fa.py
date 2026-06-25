@@ -27,11 +27,6 @@ flash_attn_func = None
 flash_attn_varlen_func = None
 
 # True when flash_attn_func is provided by aiter (ROCm only).
-# The BF16 conversion mode is controlled by parallel_config.aiter_bf16_cvt_mode:
-#   0 = RTNE (round to nearest even, IEEE default)
-#   1 = RTNA (round to nearest away, aiter API default)
-#   2 = RTZ  (round to zero / truncate) — vllm-omni default
-# On gfx950 (MI355X) the kernel falls back to RTNE regardless of the setting.
 HAS_AITER_FLASH_ATTN = False
 
 if current_omni_platform.is_rocm():
