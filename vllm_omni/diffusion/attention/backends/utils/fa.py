@@ -36,6 +36,7 @@ if current_omni_platform.is_rocm():
 
         if is_aiter_found_and_supported():
             from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+
             HAS_AITER_FLASH_ATTN = True
     except (ImportError, ModuleNotFoundError):
         pass

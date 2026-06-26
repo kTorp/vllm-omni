@@ -15,7 +15,7 @@ from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
-from vllm_omni.diffusion.forward_context import is_forward_context_available, get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 logger = init_logger(__name__)
 
