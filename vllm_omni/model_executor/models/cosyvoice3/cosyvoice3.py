@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -70,6 +71,19 @@ def _cosyvoice3_trt_enabled() -> bool:
     them — export ``COSYVOICE3_TRT=0`` in the launching shell to disable.
     """
     return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+
+
+def _campplus_onnx_providers() -> list[str]:
+    """ONNX-Runtime providers for the campplus speaker-embedding session.
+
+    Prefer ``MUSAExecutionProvider`` (from the onnxruntime-musa build) with a
+    CPU fallback when it is available; otherwise CPU only. The MUSA kernels
+    differ from the CPU reference by a few percent on the embedding, which
+    conditions voice cloning -- verify voice similarity if that matters.
+    """
+    if "MUSAExecutionProvider" in onnxruntime.get_available_providers():
+        return ["MUSAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
 
 
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
@@ -162,7 +176,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             campplus_session = onnxruntime.InferenceSession(
                 campplus_onnx_path,
                 sess_options=option,
-                providers=["CPUExecutionProvider"],
+                providers=_campplus_onnx_providers(),
             )
 
         return {
@@ -198,7 +212,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             ) from e
 
         model = _s3.load_model("speech_tokenizer_v3_25hz")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = current_omni_platform.get_torch_device()
         model = model.to(device).eval()
         cls._s3_model = (model, _s3, device)
         return cls._s3_model
@@ -921,6 +935,7 @@ class CosyVoice3Model(
         if getattr(self, "_code2wav_trt_done", False):
             return
         self._code2wav_trt_done = True
+
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
         onnx_path = self._resolve_flow_estimator_onnx()

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import functools
 import json
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -38,14 +40,18 @@ def is_nextstep_model(model_name: str) -> bool:
     return False
 
 
-def parse_profiler_config(value: str) -> dict[str, Any]:
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
     try:
         config = json.loads(value)
     except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
     if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
     return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +70,16 @@ def parse_args() -> argparse.Namespace:
         "--stage-configs-path",
         type=str,
         default=None,
-        help="Path to a YAML file containing stage configurations for Omni.",
+        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a deploy YAML (new pipeline/stages format). Required for multi-stage "
+            "text-to-image pipelines whose deploy config is not auto-loaded."
+        ),
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -150,7 +165,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution.",
+        default=None,
+        help=(
+            "Disable torch.compile and force eager execution. Left unset (None) "
+            "so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML value wins."
+        ),
     )
     parser.add_argument(
         "--enable-cpu-offload",
@@ -183,16 +203,11 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "int8", "gguf"],
+        choices=["fp8", "int8", "bitsandbytes"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), "
+        "'int8' (Int8 W8A8), 'bitsandbytes' (NF4 4-bit weight-only, CUDA SM 75+). "
         "Default: None (no quantization, uses BF16).",
-    )
-    parser.add_argument(
-        "--gguf-model",
-        type=str,
-        default=None,
-        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -216,8 +231,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help=(
+            "Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+            "Left unset so it is only forwarded when explicitly given; "
+            "otherwise the per-stage deploy YAML (or engine default of 1) wins. "
+            "Passing it always overrides the deploy YAML."
+        ),
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -269,7 +289,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--extra-body",
-        type=parse_profiler_config,
+        type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
         help=(
             "Model-specific generation params as a JSON object, e.g. "
@@ -378,14 +398,7 @@ def main():
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization == "gguf":
-        if not args.gguf_model:
-            raise ValueError("--gguf-model is required when --quantization gguf is set.")
-        quant_kwargs["quantization_config"] = {
-            "method": "gguf",
-            "gguf_model": args.gguf_model,
-        }
-    elif args.quantization and ignored_layers:
+    if args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -405,10 +418,8 @@ def main():
         "ring_degree": args.ring_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
-        "tensor_parallel_size": args.tensor_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
-        "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
@@ -420,11 +431,21 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.enforce_eager is not None:
+        omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.stage_configs_path:
         omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
+    # gate is an engine-level config (offline analog of the server's --no-guardrails).
+    if args.extra_body and "guardrails" in args.extra_body:
+        omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
@@ -442,8 +463,9 @@ def main():
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
+    tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
     print(
-        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"  Parallel configuration: tensor_parallel_size={tp_display}, "
         f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
         f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
@@ -513,8 +535,8 @@ def main():
         diffusion_params.extra_args.update({k: v for k, v in user_extra.items() if v is not None})
 
     if lora_request:
-        diffusion_params.extra_args["lora_request"] = lora_request
-        diffusion_params.extra_args["lora_scale"] = args.lora_scale
+        diffusion_params.lora_request = lora_request
+        diffusion_params.lora_scale = args.lora_scale
 
     # Build per-stage sampling params for multi-stage models (e.g. BAGEL),
     # or wrap single diffusion params for single-stage models.
@@ -534,8 +556,20 @@ def main():
         elif init_non_diffusion and hasattr(params, "extra_args"):
             if params.extra_args is None:
                 params.extra_args = {}
+            params.extra_args.update(diffusion_params.extra_args or {})
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
+
+            # MammothModa2's AR stage emits one visual token per grid cell,
+            # one EOL token per row, and one final look-ahead token whose hidden
+            # state is unavailable. Size the first stage from the prompt metadata
+            # instead of SamplingParams' default of 16 tokens.
+            prompt_info = prompt_dict.get("additional_information", {})
+            if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
+                ar_width = int(prompt_info.get("ar_width", [0])[0])
+                ar_height = int(prompt_info.get("ar_height", [0])[0])
+                if ar_width > 0 and ar_height > 0:
+                    params.max_tokens = ar_height * (ar_width + 1) + 1
 
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
@@ -579,6 +613,9 @@ def main():
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break
+
+    if not images:
+        images = extract_images_from_outputs(outputs)
 
     if not images:
         raise ValueError("No images found in request_output")
