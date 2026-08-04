@@ -1,5 +1,11 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
+# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file is
+# the high-throughput profile and intentionally keeps Stage 0 enforce_eager=true
+# so the Higgs-specific local MLP CUDA graph path remains active. For low
+# concurrency latency-sensitive serving, use
+# higgs_multimodal_qwen3_low_latency.yaml explicitly.
+#
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
 # worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
@@ -10,7 +16,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       # Stream PCM bytes back to the client as Stage 1 emits each chunk.
       codec_streaming: true
       # Streaming chunk shape for talker2code2wav_async_chunk:
@@ -32,6 +37,7 @@ stages:
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
     enforce_eager: true
+    attention_backend: FLASHINFER
     trust_remote_code: true
     # Stage-0 prefix caching is on by default. The talker's HS opt-out and
     # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
