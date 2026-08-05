@@ -28,7 +28,11 @@ def _matches_repeated_block(
     return len(parts) >= 2 and parts[-2] in repeated_block_attrs and parts[-1].isdigit()
 
 
-def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: Any) -> nn.Module:
+def regionally_compile(
+    model: nn.Module,
+    *compile_args: Any,
+    **compile_kwargs: Any,
+) -> nn.Module:
     """
     Apply regional compilation to a PyTorch model.
 

@@ -19,9 +19,10 @@ from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 from urllib.parse import quote
 
+import numpy as np
 import psutil
 import requests
 import soundfile as sf
@@ -45,9 +46,9 @@ from tests.helpers.assertions import (
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
-    convert_audio_bytes_to_text,
     decode_b64_image,
 )
+from tests.model_tests.diffusion.utils import resolve_tiny_model_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
@@ -597,7 +598,7 @@ class OmniServerStageCli(OmniServer):
             "serve",
             self.model,
             "--omni",
-            "--stage-configs-path",
+            "--deploy-config",
             self.stage_config_path,
             "--stage-id",
             str(stage_id),
@@ -638,7 +639,10 @@ class OmniServerStageCli(OmniServer):
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            # Must be repo root (not tests/): after Docker deps-cache installs an empty
+            # vllm_omni stub into site-packages, cwd on sys.path[0] is what makes
+            # ``python -m vllm_omni.entrypoints...`` resolve the real package.
+            cwd=_omni_subprocess_cwd(),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
@@ -762,6 +766,10 @@ class OmniResponse:
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     logprobs: list | None = None
+    #: HTTP status + error text for the error-handling path (e.g. validator
+    #: rejections); populated when the OpenAI client raises an APIError.
+    status_code: int | None = None
+    error_message: str | None = None
 
 
 @dataclass
@@ -793,6 +801,189 @@ class WebSocketJsonResponse:
     """First JSON object delivered as a text WebSocket frame (streaming endpoints)."""
 
     json_body: dict[str, Any]
+
+
+@dataclass
+class OpenPIWebSocketResponse:
+    """Msgpack WebSocket session against ``/v1/realtime/robot/openpi``."""
+
+    server_metadata: dict[str, Any]
+    operation_responses: list[Any]
+    actions: dict[str, np.ndarray] | None = None
+    action_tensors: list[np.ndarray] | None = None
+
+
+def build_openpi_droid_observation(*, session_id: str = "gr00t-smoke") -> dict[str, Any]:
+    """Build a minimal DROID-style observation payload for the OpenPI robot endpoint."""
+    identity_eef_9d = np.zeros((1, 1, 9), dtype=np.float32)
+    identity_eef_9d[..., 3:] = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    return {
+        "session_id": session_id,
+        "video": {
+            "exterior_image_1_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+            "wrist_image_left": np.zeros((1, 2, 256, 256, 3), dtype=np.uint8),
+        },
+        "state": {
+            "eef_9d": identity_eef_9d,
+            "gripper_position": np.zeros((1, 1, 1), dtype=np.float32),
+            "joint_position": np.zeros((1, 1, 7), dtype=np.float32),
+        },
+        "language": {"annotation.language.language_instruction": [["pick up the object"]]},
+    }
+
+
+DREAMZERO_DEFAULT_PROMPT = (
+    "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
+)
+DREAMZERO_ACTION_HORIZON = 24
+DREAMZERO_ACTION_DIM = 8
+DREAMZERO_CAMERA_FILES = {
+    "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
+    "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
+    "observation/wrist_image_left": "wrist_image_left.mp4",
+}
+
+
+def _require_opencv() -> Any:
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - optional e2e dependency
+        raise ModuleNotFoundError("DreamZero OpenPI test dependencies are missing: opencv-python") from exc
+    return cv2
+
+
+def load_dreamzero_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
+    cv2 = _require_opencv()
+    camera_frames: dict[str, np.ndarray] = {}
+    for camera_key, file_name in DREAMZERO_CAMERA_FILES.items():
+        video_path = video_dir / file_name
+        if not video_path.exists():
+            raise FileNotFoundError(f"Missing DreamZero test asset: {video_path}")
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames:
+            raise RuntimeError(f"No frames loaded from {video_path}")
+        camera_frames[camera_key] = np.stack(frames, axis=0)
+    return camera_frames
+
+
+def build_dreamzero_demo_observations(
+    camera_frames: dict[str, np.ndarray],
+    *,
+    prompt: str,
+    session_id: str,
+    num_chunks: int = 2,
+) -> list[dict[str, Any]]:
+    if num_chunks < 1:
+        raise ValueError("num_chunks must be at least 1")
+
+    relative_offsets = [-23, -16, -8, 0]
+    total_frames = min(frames.shape[0] for frames in camera_frames.values())
+    frame_schedules = [[0]]
+    current_frame = 23
+    for _ in range(num_chunks - 1):
+        indices = [max(current_frame + offset, 0) for offset in relative_offsets]
+        if indices[-1] >= total_frames:
+            break
+        frame_schedules.append(indices)
+        current_frame += DREAMZERO_ACTION_HORIZON
+
+    observations: list[dict[str, Any]] = []
+    for frame_indices in frame_schedules:
+        obs: dict[str, Any] = {}
+        for camera_key, all_frames in camera_frames.items():
+            selected = all_frames[frame_indices]
+            obs[camera_key] = selected[0] if len(frame_indices) == 1 else selected
+        obs["observation/joint_position"] = np.zeros(7, dtype=np.float32)
+        obs["observation/cartesian_position"] = np.zeros(6, dtype=np.float32)
+        obs["observation/gripper_position"] = np.zeros(1, dtype=np.float32)
+        obs["prompt"] = prompt
+        obs["session_id"] = session_id
+        observations.append(obs)
+    return observations
+
+
+class OpenPIWebSocketSession:
+    """Persistent msgpack session for ``/v1/realtime/robot/openpi``."""
+
+    DEFAULT_PING_INTERVAL_SECS = 300
+    DEFAULT_PING_TIMEOUT_SECS = 3600
+
+    @staticmethod
+    def _require_dependencies() -> tuple[Any, Any]:
+        try:
+            import websockets.sync.client as websockets_client
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
+        try:
+            from openpi_client import msgpack_numpy
+        except ImportError as exc:  # pragma: no cover - optional e2e dependency
+            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        return websockets_client, msgpack_numpy
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        ping_interval: float = DEFAULT_PING_INTERVAL_SECS,
+        ping_timeout: float = DEFAULT_PING_TIMEOUT_SECS,
+        open_timeout: float = 120.0,
+        close_timeout: float = 120.0,
+    ) -> None:
+        websockets_client, msgpack_numpy = self._require_dependencies()
+        self._msgpack_numpy = msgpack_numpy
+        self._packer = msgpack_numpy.Packer()
+        self._conn = websockets_client.connect(
+            uri,
+            compression=None,
+            max_size=None,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=open_timeout,
+            close_timeout=close_timeout,
+        )
+        server_metadata = msgpack_numpy.unpackb(self._conn.recv())
+        if not isinstance(server_metadata, dict):
+            raise TypeError(f"Expected dict metadata from {uri}, got {type(server_metadata)!r}")
+        self._server_metadata = server_metadata
+
+    def get_server_metadata(self) -> dict[str, Any]:
+        return dict(self._server_metadata)
+
+    def infer(self, obs: dict[str, Any]) -> dict[str, np.ndarray]:
+        response = self._send_operation("infer", obs)
+        if not isinstance(response, dict):
+            raise TypeError(f"Expected dict infer response, got {type(response)!r}")
+        return {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+
+    def reset(self, reset_info: dict[str, Any] | None = None) -> str:
+        response = self._send_operation("reset", dict(reset_info or {}))
+        return str(response["status"])
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def _send_operation(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        body = dict(payload)
+        body["endpoint"] = endpoint
+        self._conn.send(self._packer.pack(body))
+        raw = self._conn.recv()
+        if isinstance(raw, str):
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {raw}")
+        decoded = self._msgpack_numpy.unpackb(raw)
+        if isinstance(decoded, dict) and decoded.get("type") == "error":
+            raise RuntimeError(f"OpenPI {endpoint!r} failed: {decoded.get('message')}")
+        if endpoint == "reset":
+            if not isinstance(decoded, dict) or decoded.get("status") != "reset successful":
+                raise RuntimeError(f"Unexpected OpenPI reset response: {decoded!r}")
+            return decoded
+        return decoded
 
 
 def _merge_http_expectation_kwargs(
@@ -894,16 +1085,13 @@ class OpenAIClientHandler:
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
 
-            audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
                 wav_buf = BytesIO()
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
-                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_data = audio_data
-            result.audio_content = audio_content
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
@@ -928,12 +1116,9 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
-            audio_content = None
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
-                audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
-            result.audio_content = audio_content
             result.e2e_latency = time.perf_counter() - wall_start
             if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
                 result.logprobs = chat_completion.choices[0].logprobs.content
@@ -1059,6 +1244,29 @@ class OpenAIClientHandler:
             err_message=err_message,
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/completions`` with ``json`` or ``raw_body``."""
+        # TODO (Alex): A lot of these helpers should be consolidated as they differ only by endpoint
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/completions", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
         assert_http_error(
             resp,
@@ -1473,6 +1681,8 @@ class OpenAIClientHandler:
 
         - ``send_frames``: optional ``str`` or sequence of ``str`` raw WebSocket text frames (omit when the server
           speaks first, e.g. ``/v1/realtime`` rejection path).
+        - ``ws_skip_types``: optional event ``type`` strings to ignore while waiting for the first matching frame
+          (e.g. ``["session.created"]`` on ``/v1/realtime``).
         - ``timeout``: seconds to wait for the first inbound text frame (default ``120``).
         - ``ws_max_size``: passed through as ``max_size`` to :func:`websockets.connect` when the key is present.
         """
@@ -1486,6 +1696,7 @@ class OpenAIClientHandler:
 
         timeout = float(cfg.get("timeout", 120.0))
         uri = self._build_ws_url(path)
+        skip_types = set(cfg.get("ws_skip_types") or [])
 
         connect_kw: dict[str, Any] = {}
         if "ws_max_size" in cfg:
@@ -1497,16 +1708,19 @@ class OpenAIClientHandler:
             async with websockets.connect(uri, **connect_kw) as ws:
                 for frame in frames:
                     await ws.send(frame)
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                if not isinstance(raw, str):
-                    raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
-                if not isinstance(data, dict):
-                    raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
-                return WebSocketJsonResponse(json_body=data)
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    if not isinstance(raw, str):
+                        raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
+                    if not isinstance(data, dict):
+                        raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
+                    if skip_types and data.get("type") in skip_types:
+                        continue
+                    return WebSocketJsonResponse(json_body=data)
 
         resp = asyncio.run(_recv_first_json_object())
         _run_ws_expectations_from_request_config(cfg, resp)
@@ -1563,6 +1777,92 @@ class OpenAIClientHandler:
         )
         return self._send_websocket_first_json_request("/v1/realtime", cfg)
 
+    def send_robot_openpi_ws_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+    ) -> list[OpenPIWebSocketResponse]:
+        """WebSocket ``/v1/realtime/robot/openpi`` — msgpack metadata plus optional infer/reset ops.
+
+        ``request_config`` keys:
+
+        - ``operations``: optional sequence of ``{"endpoint": "infer"|"reset", "payload": {...}}``.
+        - ``run_default_policy_session``: when true and ``operations`` is omitted, run infer then reset
+          using :func:`build_openpi_droid_observation`.
+        - ``run_dreamzero_policy_session``: when true and ``operations`` is omitted, run the DreamZero
+          infer/reset/infer sequence using :func:`build_dreamzero_demo_observations`.
+        - ``video_dir``: required for ``run_dreamzero_policy_session``.
+        - ``prompt``: language instruction for DreamZero observations (optional).
+        - ``session_id``: used by the default policy session observation builder.
+        - ``num_chunks``: DreamZero chunk count (default ``2``).
+        - ``timeout``: seconds to wait for each inbound msgpack frame (default ``120``).
+        - ``ping_interval`` / ``ping_timeout``: forwarded to :func:`websockets.sync.client.connect`.
+        """
+        cfg = dict(request_config or {})
+        operations_cfg = cfg.get("operations")
+        if operations_cfg is not None:
+            operations = [dict(op) for op in operations_cfg]
+        elif cfg.get("run_dreamzero_policy_session"):
+            video_dir = cfg.get("video_dir")
+            if video_dir is None:
+                raise ValueError("run_dreamzero_policy_session requires video_dir")
+            session_id = str(cfg.get("session_id", "dreamzero-smoke"))
+            prompt = str(cfg.get("prompt", DREAMZERO_DEFAULT_PROMPT))
+            num_chunks = int(cfg.get("num_chunks", 2))
+            observations = build_dreamzero_demo_observations(
+                load_dreamzero_camera_frames(Path(video_dir)),
+                prompt=prompt,
+                session_id=session_id,
+                num_chunks=num_chunks,
+            )
+            operations = [{"endpoint": "infer", "payload": obs} for obs in observations]
+            operations.append({"endpoint": "reset", "payload": {}})
+            operations.append({"endpoint": "infer", "payload": observations[0]})
+        elif cfg.get("run_default_policy_session"):
+            session_id = str(cfg.get("session_id", "gr00t-smoke"))
+            operations = [
+                {"endpoint": "infer", "payload": build_openpi_droid_observation(session_id=session_id)},
+                {"endpoint": "reset", "payload": {}},
+            ]
+        else:
+            operations = []
+        timeout = float(cfg.get("timeout", 120.0))
+        ping_interval = float(cfg.get("ping_interval", OpenPIWebSocketSession.DEFAULT_PING_INTERVAL_SECS))
+        ping_timeout = float(cfg.get("ping_timeout", OpenPIWebSocketSession.DEFAULT_PING_TIMEOUT_SECS))
+
+        uri = self._build_ws_url("/v1/realtime/robot/openpi")
+        session = OpenPIWebSocketSession(
+            uri,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            open_timeout=timeout,
+            close_timeout=timeout,
+        )
+        try:
+            operation_responses: list[Any] = []
+            actions: dict[str, np.ndarray] | None = None
+            action_tensors: list[np.ndarray] = []
+            for operation in operations:
+                endpoint = str(operation["endpoint"])
+                payload = dict(operation.get("payload") or {})
+                response = session._send_operation(endpoint, payload)
+                operation_responses.append(response)
+                if endpoint == "infer":
+                    if isinstance(response, dict):
+                        actions = {str(key): np.asarray(value, dtype=np.float32) for key, value in response.items()}
+                    else:
+                        action_tensors.append(np.asarray(response, dtype=np.float32))
+        finally:
+            session.close()
+
+        return [
+            OpenPIWebSocketResponse(
+                server_metadata=session.get_server_metadata(),
+                operation_responses=operation_responses,
+                actions=actions,
+                action_tensors=action_tensors or None,
+            )
+        ]
+
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """Chat completions via the OpenAI Python SDK (not raw HTTP)."""
         responses: list[OmniResponse] = []
@@ -1577,6 +1877,8 @@ class OpenAIClientHandler:
             extra_body["mm_processor_kwargs"] = mm
         if "sampling_params_list" in request_config:
             extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+        if request_config.get("extra_body"):
+            extra_body.update(request_config["extra_body"])
 
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
@@ -1638,8 +1940,8 @@ class OpenAIClientHandler:
         Process streaming /v1/audio/speech responses into an OmniResponse.
 
         This mirrors _process_stream_omni_response but operates on low-level
-        audio bytes and produces an OmniResponse with audio_content filled
-        from Whisper transcription.
+        audio bytes. Whisper transcription runs in assert_audio_speech_response
+        when the run_level requires it.
         """
         result = OmniResponse()
 
@@ -1675,14 +1977,9 @@ class OpenAIClientHandler:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
 
             raw_bytes = bytes(data)
-            if response_format == "pcm":
-                transcript = None
-            else:
-                transcript = convert_audio_bytes_to_text(raw_bytes)
 
             # Populate OmniResponse.
             result.audio_bytes = raw_bytes
-            result.audio_content = transcript
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
@@ -1715,13 +2012,7 @@ class OpenAIClientHandler:
             else:
                 raise TypeError(f"Unsupported audio speech response type: {type(response)}")
 
-            if response_format == "pcm":
-                transcript = None
-            else:
-                transcript = convert_audio_bytes_to_text(raw_bytes)
-
             result.audio_bytes = raw_bytes
-            result.audio_content = transcript
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
@@ -1767,7 +2058,18 @@ class OpenAIClientHandler:
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
-        for key in ("task_type", "ref_text", "ref_audio", "language", "max_new_tokens", "seed"):
+        for key in (
+            "task_type",
+            "ref_text",
+            "ref_audio",
+            "language",
+            "max_new_tokens",
+            "seed",
+            "instructions",
+            "speed",
+            "stream_format",
+            "x_vector_only_mode",
+        ):
             if key in request_config:
                 extra_body[key] = request_config[key]
 
@@ -2065,6 +2367,9 @@ class OpenAIClientHandler:
         normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
         files: dict[str, tuple[str, BytesIO, str]] = {}
         image_reference = request_config.get("image_reference")
+        video_reference = request_config.get("video_reference")
+        if image_reference and video_reference:
+            raise ValueError("Only one of image_reference or video_reference can be provided")
         if image_reference:
             if image_reference.startswith("data:image"):
                 header, encoded = image_reference.split(",", 1)
@@ -2074,6 +2379,15 @@ class OpenAIClientHandler:
                 files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
             else:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+        if video_reference:
+            if video_reference.startswith("data:video"):
+                header, encoded = video_reference.split(",", 1)
+                content_type = header.split(";")[0].removeprefix("data:")
+                extension = content_type.split("/")[-1]
+                file_data = base64.b64decode(encoded)
+                files["input_reference"] = (f"reference.{extension}", BytesIO(file_data), content_type)
+            else:
+                normalized_form_data["video_reference"] = json.dumps({"video_url": video_reference})
 
         result = DiffusionResponse()
         create_url = self._build_url("/v1/videos")
@@ -2149,6 +2463,102 @@ class OpenAIClientHandler:
             timeout=timeout,
         )
 
+    def send_streaming_video_diffusion_request(
+        self,
+        request_config: dict[str, Any],
+        request_num: int = 1,
+        *,
+        timeout_seconds: float = 600.0,
+    ) -> list[DiffusionResponse]:
+        """
+        Send a native ``/v1/realtime/video`` WebSocket request and return one
+        finalized MP4 artifact assembled from the streamed binary fragments.
+        """
+        if request_num != 1:
+            raise NotImplementedError("Concurrent streaming video diffusion requests are not currently implemented")
+
+        response = asyncio.run(
+            self._send_streaming_video_diffusion_request_once(
+                request_config,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        assert_diffusion_response(response, request_config, run_level=self.run_level)
+        if response.e2e_latency is not None:
+            self._print_client_stat(f"[diffusion.stream] request#1 success in {response.e2e_latency:.3f}s")
+        else:
+            self._print_client_stat("[diffusion.stream] request#1 completed")
+        return [response]
+
+    async def _send_streaming_video_diffusion_request_once(
+        self,
+        request_config: dict[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> DiffusionResponse:
+        form_data = request_config.get("form_data")
+        if not isinstance(form_data, dict):
+            raise ValueError("Video request_config must contain 'form_data'")
+        payload: dict[str, Any] = {
+            "type": "session.start",
+            **{key: value for key, value in form_data.items() if value is not None},
+        }
+        model = request_config.get("model")
+        if model is not None:
+            payload["model"] = model
+        payload.setdefault("format", "m4s")
+
+        fps = float(payload.get("fps") or 16)
+        stream_format = payload["format"]
+        url = self._build_ws_url("/v1/realtime/video")
+
+        result = DiffusionResponse()
+        chunks: list[bytes] = []
+        start_time = time.perf_counter()
+        deadline = start_time + timeout_seconds
+
+        import websockets
+
+        async with websockets.connect(url, max_size=None) as websocket:
+            await websocket.send(json.dumps(payload))
+
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError(f"Streaming video request did not complete within {timeout_seconds}s")
+
+                message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                if isinstance(message, bytes):
+                    chunks.append(message)
+                    continue
+
+                msg = json.loads(message)
+                msg_type = msg.get("type")
+                if msg_type == "video.start":
+                    stream_format = msg.get("format") or stream_format
+                    continue
+                if msg_type == "session.done":
+                    break
+                if msg_type == "error":
+                    raise RuntimeError(str(msg.get("message", msg)))
+
+        from vllm_omni.diffusion.utils.media_utils import finalize_streaming_video_bytes
+        from vllm_omni.entrypoints.openai.video_api_utils import StreamingVideoFormat
+
+        streamed_bytes = b"".join(chunks)
+        if not streamed_bytes:
+            raise RuntimeError("Streaming video request completed without binary video chunks")
+        result.videos = [
+            finalize_streaming_video_bytes(
+                streamed_bytes,
+                input_format=cast(StreamingVideoFormat, stream_format),
+                fps=fps,
+            )
+        ]
+        result.e2e_latency = time.perf_counter() - start_time
+        result.success = True
+        return result
+
     def _wait_until_video_completed(
         self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
     ) -> None:
@@ -2196,7 +2606,6 @@ class OmniRunner:
         # production default in AsyncOmniEngine remains 600s; this only
         # affects the test runner wrapper.
         init_timeout: int = 1800,
-        shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,
         **kwargs,
@@ -2216,7 +2625,6 @@ class OmniRunner:
             stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
-            shm_threshold_bytes=shm_threshold_bytes,
             stage_configs_path=stage_configs_path,
             **kwargs,
         )
@@ -2286,6 +2694,10 @@ class OmniRunner:
         video_padding_token = "<|VIDEO|>"
         image_padding_token = "<|IMAGE|>"
         audio_padding_token = "<|AUDIO|>"
+        # Default wrapping for Qwen-style models (bos/eos around the placeholder).
+        audio_fmt = "<|audio_bos|>{p}<|audio_eos|>"
+        image_fmt = "<|vision_bos|>{p}<|vision_eos|>"
+        video_fmt = "<|vision_bos|>{p}<|vision_eos|>"
         if "Qwen3-Omni-30B-A3B-Instruct" in self.model_name:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
@@ -2294,6 +2706,15 @@ class OmniRunner:
             video_padding_token = "<VIDEO>"
             image_padding_token = "<IMAGE>"
             audio_padding_token = "<AUDIO>"
+        elif "MiniCPM" in self.model_name:
+            # MiniCPM-o expects the bare placeholder literals (with parens and ./),
+            # not Qwen-style bos/eos wrapping.
+            video_padding_token = "(<video>./</video>)"
+            image_padding_token = "(<image>./</image>)"
+            audio_padding_token = "(<audio>./</audio>)"
+            audio_fmt = "{p}"
+            image_fmt = "{p}"
+            video_fmt = "{p}"
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -2354,28 +2775,28 @@ class OmniRunner:
             if audio is not None:
                 if isinstance(audio, list):
                     for _ in audio:
-                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                        user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
                 else:
-                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    user_content += audio_fmt.format(p=audio_padding_token)
                     multi_modal_data["audio"] = audio
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
                     for _ in image:
-                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                        user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
                 else:
-                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    user_content += image_fmt.format(p=image_padding_token)
                     multi_modal_data["image"] = image
             video = videos_list[i]
             if video is not None:
                 if isinstance(video, list):
                     for _ in video:
-                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                        user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
                 else:
-                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    user_content += video_fmt.format(p=video_padding_token)
                     multi_modal_data["video"] = video
             user_content += prompt_text
 
@@ -2669,25 +3090,6 @@ class OmniRunnerHandler:
 # ---------------------------------------------------------------------------
 
 
-def _core_model_stage_config_path_with_dummy_load_format(stage_config_path: str | None, run_level: str) -> str | None:
-    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
-    if run_level != "core_model" or stage_config_path is None:
-        return stage_config_path
-    from tests.helpers.stage_config import modify_stage_config
-
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    new_schema_stages = cfg.get("stages")
-    stage_key = "stages" if new_schema_stages is not None else "stage_args"
-    update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-    stage_entries = cfg.get(stage_key, [])
-    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-    return modify_stage_config(
-        stage_config_path,
-        updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
-    )
-
-
 def iter_omni_server(
     request: Any,
     run_level: str,
@@ -2695,27 +3097,28 @@ def iter_omni_server(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import modify_stage_config
+    from tests.helpers.stage_config import stage_config_path_for_run_level
 
     with omni_fixture_lock:
         params: OmniServerParams = request.param
-        model = model_prefix + params.model
+        # For now, when a tiny model is substituted, we preserve the original model
+        # name via --served-model-name (so that the server still accepts requests with
+        # the original name). We also do the same for server.model so that tests reading
+        # server.model send the correct name in requests.
+        #
+        # TODO: core models on this path currently do not clean up tiny models, although
+        # tiny model paths are deterministic, so it's not a huge footprint. Still, it would
+        # be ideal to cleanup consistently everywhere.
+        original_model = model_prefix + params.model
+        model = original_model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
         port = params.port
-        stage_config_path = params.stage_config_path
-        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
-            with open(stage_config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            new_schema_stages = cfg.get("stages")
-            stage_key = "stages" if new_schema_stages is not None else "stage_args"
-            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-            stage_entries = cfg.get(stage_key, [])
-            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-            stage_config_path = modify_stage_config(
-                stage_config_path,
-                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
-            )
+        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
 
         server_args = params.server_args or []
+        if model != original_model:
+            server_args = [*server_args, "--served-model-name", original_model]
         if params.use_omni and params.stage_init_timeout is not None:
             server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
         else:
@@ -2732,7 +3135,7 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
+            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -2741,12 +3144,14 @@ def iter_omni_server(
                 port=port,
                 env_dict=params.env_dict,
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
+                server_args += ["--deploy-config", stage_config_path]
 
             with (
                 OmniServer(
@@ -2764,6 +3169,8 @@ def iter_omni_server(
                     use_omni=params.use_omni,
                 )
             ) as server:
+                if model != original_model:
+                    server.model = original_model
                 print("OmniServer started successfully")
                 yield server
                 print("OmniServer stopping...")
@@ -2778,6 +3185,8 @@ def iter_omni_runner(
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, None, None]:
     """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
+    from tests.helpers.stage_config import stage_config_path_for_run_level
+
     with omni_fixture_lock:
         param = request.param
         if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
@@ -2791,8 +3200,10 @@ def iter_omni_runner(
         else:
             model, stage_config_path, extra = param[0], param[1], param[2]
             extra_omni_kwargs = dict(extra) if extra is not None else {}
-        stage_config_path = _core_model_stage_config_path_with_dummy_load_format(stage_config_path, run_level)
+        stage_config_path = stage_config_path_for_run_level(stage_config_path, run_level)
         model = model_prefix + model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
@@ -2805,6 +3216,14 @@ __all__ = [
     "DiffusionResponse",
     "HttpResponse",
     "WebSocketJsonResponse",
+    "OpenPIWebSocketResponse",
+    "build_openpi_droid_observation",
+    "build_dreamzero_demo_observations",
+    "DREAMZERO_ACTION_DIM",
+    "DREAMZERO_ACTION_HORIZON",
+    "DREAMZERO_CAMERA_FILES",
+    "load_dreamzero_camera_frames",
+    "OpenPIWebSocketSession",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",
