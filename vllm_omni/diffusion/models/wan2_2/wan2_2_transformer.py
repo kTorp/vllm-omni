@@ -782,8 +782,6 @@ class WanTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
-    # Opt into inductor compute/comm overlap reordering.
-    _reorder_compute_comm_overlap = True
     _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],

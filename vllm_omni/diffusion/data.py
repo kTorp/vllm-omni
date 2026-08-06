@@ -711,6 +711,7 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    diffusion_compile_reorder_comm_overlap: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -915,6 +916,11 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_compile_reorder_comm_overlap, bool):
+            raise TypeError(
+                "diffusion_compile_reorder_comm_overlap must be a bool, "
+                f"got {type(self.diffusion_compile_reorder_comm_overlap)!r}"
+            )
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if self.request_batch_max_wait_ms < 0:

@@ -1041,6 +1041,11 @@ class AsyncOmniEngine:
             "diffusion_compile_dynamic": (
                 True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
             ),
+            "diffusion_compile_reorder_comm_overlap": (
+                False
+                if kwargs.get("diffusion_compile_reorder_comm_overlap") is None
+                else kwargs["diffusion_compile_reorder_comm_overlap"]
+            ),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),

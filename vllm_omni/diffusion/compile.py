@@ -51,18 +51,6 @@ def regionally_compile(
         logger.warning("Regional compilation skipped because the model does not define `_repeated_blocks`.")
         return model
 
-    # Opt-in: reorder compute/comm to overlap collectives with compute.
-    if getattr(model, "_reorder_compute_comm_overlap", False):
-        compile_kwargs["options"] = {
-            **(compile_kwargs.get("options") or {}),
-            "reorder_for_compute_comm_overlap": True,
-            "reorder_for_compute_comm_overlap_passes": [
-                "reorder_communication_preserving_peak_memory",
-                "sink_waits_iterative",
-                "reorder_communication_preserving_peak_memory",
-            ],
-        }
-
     repeated_block_attrs = getattr(model, "_layerwise_offload_blocks_attrs", [])
 
     # Build all compiled callables before mutating the model. This keeps setup

@@ -765,8 +765,6 @@ class Flux2Transformer2DModel(nn.Module):
     )
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
-    # Opt into inductor compute/comm overlap reordering.
-    _reorder_compute_comm_overlap = True
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     _sp_plan = {
         "": {
