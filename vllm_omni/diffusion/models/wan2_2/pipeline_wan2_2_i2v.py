@@ -16,6 +16,7 @@ import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
@@ -53,7 +54,10 @@ logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 
 
-def _resolve_component_quant_config(quant_config, component: str):
+def _resolve_component_quant_config(
+    quant_config: QuantizationConfig | None,
+    component: str,
+) -> QuantizationConfig | None:
     component_configs = getattr(quant_config, "component_configs", None)
     if component_configs is not None:
         return component_configs.get(component, quant_config.default_config)
