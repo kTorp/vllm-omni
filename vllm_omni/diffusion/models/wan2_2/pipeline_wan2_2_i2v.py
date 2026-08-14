@@ -281,7 +281,6 @@ class Wan22I2VPipeline(
             od_config.quantization_config,
             "transformer",
         )
-        logger.warning("[quant-debug] transformer quant_config=%r", transformer_quant_config)
         self.transformer = create_transformer_from_config(
             transformer_config,
             quant_config=transformer_quant_config,
@@ -292,7 +291,6 @@ class Wan22I2VPipeline(
                 od_config.quantization_config,
                 "transformer_2",
             )
-            logger.warning("[quant-debug] transformer_2 quant_config=%r", transformer_2_quant_config)
             self.transformer_2 = create_transformer_from_config(
                 transformer_2_config,
                 quant_config=transformer_2_quant_config,
