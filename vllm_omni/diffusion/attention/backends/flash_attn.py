@@ -16,8 +16,8 @@ from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -338,7 +338,7 @@ class FlashAttentionImpl(AttentionImpl):
                     cfg = get_forward_context().omni_diffusion_config
                     if cfg is not None:
                         mode = cfg.aiter_bf16_cvt_mode
-                fa_kwargs["how_v3_bf16_cvt"] = mode       
+                fa_kwargs["how_v3_bf16_cvt"] = mode
 
             if self.fa_deterministic:
                 fa_kwargs["deterministic"] = True
