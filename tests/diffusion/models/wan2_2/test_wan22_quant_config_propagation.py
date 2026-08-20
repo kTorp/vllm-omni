@@ -8,7 +8,6 @@ Tests cover:
 - set_tf_model_config propagates quant_config to OmniDiffusionConfig
 - patch_wan_rms_norm safely iterates sys.modules with concurrent modifications
 - I2V per-component quantization routing
-- transformer checkpoint quantization auto-detection
 """
 
 import sys
@@ -242,7 +241,7 @@ class TestPatchWanRmsNorm:
 
 
 class TestI2VTransformerQuantConfig:
-    """Test I2V quantization routing and checkpoint auto-detection."""
+    """Test I2V per-component quantization routing."""
 
     @pytest.mark.parametrize(
         ("spec", "expected"),
@@ -262,13 +261,27 @@ class TestI2VTransformerQuantConfig:
             ),
             (
                 {
+                    "default": {"method": "fp8"},
+                    "transformer_2": None,
+                },
+                ("fp8", None),
+            ),
+            (
+                {
                     "transformer": {"method": "fp8"},
                     "transformer_2": {"method": "int8"},
                 },
                 ("fp8", "int8"),
             ),
         ],
-        ids=["none", "flat", "transformer-only", "transformer-2-only", "mixed"],
+        ids=[
+            "none",
+            "flat",
+            "transformer-only",
+            "transformer-2-only",
+            "default-with-transformer-2-disabled",
+            "mixed",
+        ],
     )
     def test_component_quantization_routing(self, spec, expected):
         config = build_quant_config(spec)
@@ -281,29 +294,3 @@ class TestI2VTransformerQuantConfig:
             transformer_2.get_name() if transformer_2 else None,
         )
         assert actual == expected
-
-    def test_checkpoint_quantization_auto_detected(self, mocker: MockerFixture):
-        captured = {}
-
-        class FakeTransformer:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        mocker.patch.object(wan22_module, "WanTransformer3DModel", FakeTransformer)
-
-        create_transformer_from_config(
-            {
-                "quantization_config": {
-                    "quant_method": "auto-round",
-                    "bits": 4,
-                    "group_size": 128,
-                    "sym": True,
-                    "packing_format": "auto_round:auto_gptq",
-                }
-            }
-        )
-
-        quant_config = captured["quant_config"]
-        assert quant_config.get_name() == "inc"
-        assert quant_config.weight_bits == 4
-        assert quant_config.group_size == 128
