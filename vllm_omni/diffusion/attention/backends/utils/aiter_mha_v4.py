@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compile-safe wrappers for the AITER MHA v4 MXFP4 attention recipe."""
+"""Compile-safe wrappers for AITER MHA v4 MXFP4 attention recipes."""
 
 from collections.abc import Callable
 
@@ -11,10 +11,12 @@ try:
     from aiter.ops.mha_v4 import mha_v4_packed as _aiter_mha_v4_packed
     from aiter.ops.mha_v4 import mha_v4_q_multiplier as _aiter_mha_v4_q_multiplier
     from aiter.ops.mha_v4 import mxfp4_k_view as _aiter_mxfp4_k_view
+    from aiter.ops.mha_v4 import mxfp4_v_view as _aiter_mxfp4_v_view
     from aiter.ops.mha_v4 import native_fp8_format as _aiter_native_fp8_format
     from aiter.ops.mha_v4 import quantize_mxfp4_k as _aiter_quantize_mxfp4_k
     from aiter.ops.mha_v4 import quantize_mxfp4_q as _aiter_quantize_mxfp4_q
     from aiter.ops.mha_v4 import quantize_v_fp8 as _aiter_quantize_v_fp8
+    from aiter.ops.mha_v4 import quantize_v_mxfp4 as _aiter_quantize_v_mxfp4
     from aiter.ops.mha_v4 import scale_modes_for_formats as _aiter_scale_modes_for_formats
 
     _MHA_V4_IMPORT_ERROR: ImportError | None = None
@@ -23,10 +25,12 @@ except ImportError as exc:
     _aiter_mha_v4_packed = None
     _aiter_mha_v4_q_multiplier = None
     _aiter_mxfp4_k_view = None
+    _aiter_mxfp4_v_view = None
     _aiter_native_fp8_format = None
     _aiter_quantize_mxfp4_k = None
     _aiter_quantize_mxfp4_q = None
     _aiter_quantize_v_fp8 = None
+    _aiter_quantize_v_mxfp4 = None
     _aiter_scale_modes_for_formats = None
     _MHA_V4_IMPORT_ERROR = exc
 
@@ -88,6 +92,20 @@ def _aiter_mx_quantize_v_fake(
     return _aiter_quantize_v_fp8(value)
 
 
+@torch.library.custom_op("vllm_omni::aiter_f4_quantize_v_raw", mutates_args=())
+def _aiter_f4_quantize_v_raw(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _aiter_quantize_v_mxfp4(value)
+
+
+@_aiter_f4_quantize_v_raw.register_fake
+def _aiter_f4_quantize_v_raw_fake(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _aiter_quantize_v_mxfp4(value)
+
+
 @torch.library.custom_op("vllm_omni::aiter_mxfp4_kernel_raw", mutates_args=())
 def _aiter_mxfp4_kernel_raw(
     q_fp4: torch.Tensor,
@@ -145,7 +163,7 @@ def _forward_mxfp4(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale,causal
+    del softmax_scale, causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -165,7 +183,88 @@ def _forward_mxfp4(
     )
 
 
+@torch.library.custom_op("vllm_omni::aiter_f4f4_kernel_raw", mutates_args=())
+def _aiter_f4f4_kernel_raw(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_buf: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_buf: torch.Tensor,
+    v_scale: torch.Tensor,
+    softmax_scale: float,
+    kv_len: int,
+) -> torch.Tensor:
+    k_fp4 = _aiter_mxfp4_k_view(k_buf, k_scale)
+    v_fp4 = _aiter_mxfp4_v_view(v_buf, v_scale, kv_len)
+    return _aiter_mha_v4_packed(
+        q_fp4,
+        k_fp4,
+        v_fp4,
+        q_scale,
+        k_scale,
+        v_scale,
+        _AiterAttentionFormat.MXFP4,
+        _AiterAttentionFormat.MXFP4,
+        _AiterAttentionFormat.MXFP4,
+        *_aiter_scale_modes_for_formats(
+            _AiterAttentionFormat.MXFP4,
+            _AiterAttentionFormat.MXFP4,
+            _AiterAttentionFormat.MXFP4,
+        ),
+        softmax_scale=softmax_scale,
+    )
+
+
+@_aiter_f4f4_kernel_raw.register_fake
+def _aiter_f4f4_kernel_raw_fake(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_buf: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_buf: torch.Tensor,
+    v_scale: torch.Tensor,
+    softmax_scale: float,
+    kv_len: int,
+) -> torch.Tensor:
+    del k_buf, k_scale, v_buf, v_scale, softmax_scale, kv_len
+    batch, seq_len, num_heads, _ = q_fp4.shape
+    return q_fp4.new_empty(
+        (batch, seq_len, num_heads, q_scale.shape[-1] * 32),
+        dtype=torch.bfloat16,
+    )
+
+
+def _forward_f4f4(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    del softmax_scale, causal
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    softmax_scale = query.shape[-1] ** -0.5
+
+    q_fp4, q_scale = _aiter_mxfp4_quantize_q(query, softmax_scale)
+    k_buf, k_scale = _aiter_mxfp4_quantize_k_raw(key)
+    v_buf, v_scale = _aiter_f4_quantize_v_raw(value)
+    return _aiter_f4f4_kernel_raw(
+        q_fp4,
+        q_scale,
+        k_buf,
+        k_scale,
+        v_buf,
+        v_scale,
+        softmax_scale,
+        value.shape[1],
+    )
+
+
 _FORWARD_FNS: dict[str, Callable[..., torch.Tensor]] = {
+    "f4f4": _forward_f4f4,
     "mxfp4": _forward_mxfp4,
 }
 

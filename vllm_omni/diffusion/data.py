@@ -1619,12 +1619,14 @@ class AiterQuantSpec:
     """Typed configuration for the ROCm AITER quantized attention backend."""
 
     format: str = "mxfp4"
+    _VALID_FORMATS = frozenset({"f4f4", "mxfp4"})
 
     def __post_init__(self) -> None:
         self.format = str(self.format).lower()
-        if self.format != "mxfp4":
+        if self.format not in self._VALID_FORMATS:
             raise ValueError(
-                f"aiter_quant.format={self.format!r} unsupported; only 'mxfp4' is available."
+                f"aiter_quant.format={self.format!r} unsupported; "
+                f"use one of {sorted(self._VALID_FORMATS)}."
             )
 
 

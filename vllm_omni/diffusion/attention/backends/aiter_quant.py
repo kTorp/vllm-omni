@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""AITER MHA v4 MXFP4 diffusion attention backend."""
+"""AITER MHA v4 quantized diffusion attention backend."""
 
 import torch
 
@@ -16,7 +16,8 @@ from vllm_omni.diffusion.attention.backends.utils.aiter_mha_v4 import (
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 _REQUIRED_HEAD_DIM = 128
-_SUPPORTED_FORMAT = "mxfp4"
+_DEFAULT_FORMAT = "mxfp4"
+_SUPPORTED_FORMATS = frozenset({"f4f4", "mxfp4"})
 _SUPPORTED_LAYOUTS = frozenset({"BSND", "BSHD"})
 
 
@@ -74,10 +75,11 @@ class AiterQuantImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         options = backend_kwargs or {}
-        format_name = str(options.get("format", _SUPPORTED_FORMAT)).lower()
-        if format_name != _SUPPORTED_FORMAT:
+        format_name = str(options.get("format", _DEFAULT_FORMAT)).lower()
+        if format_name not in _SUPPORTED_FORMATS:
             raise ValueError(
-                f"Unknown AITER quant format {format_name!r}; only {_SUPPORTED_FORMAT!r} is supported."
+                f"Unknown AITER quant format {format_name!r}; "
+                f"expected one of {sorted(_SUPPORTED_FORMATS)}."
             )
         if causal:
             raise NotImplementedError("AITER_QUANT_ATTN does not support causal attention.")
