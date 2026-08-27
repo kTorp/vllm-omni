@@ -87,8 +87,23 @@ class AiterQuantImpl(AttentionImpl):
             raise NotImplementedError(
                 f"AITER_QUANT_ATTN requires head_dim={_REQUIRED_HEAD_DIM}; got {head_size}."
             )
-        if num_kv_heads is not None and num_kv_heads != num_heads:
-            raise NotImplementedError("AITER_QUANT_ATTN does not support grouped-query attention.")
+        kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        if num_heads <= 0 or kv_heads <= 0:
+            raise ValueError(
+                "AITER_QUANT_ATTN requires positive query and KV head counts; "
+                f"got num_heads={num_heads}, num_kv_heads={kv_heads}."
+            )
+        if num_heads % kv_heads != 0:
+            raise ValueError(
+                "AITER_QUANT_ATTN requires query heads to be divisible by KV heads; "
+                f"got num_heads={num_heads}, num_kv_heads={kv_heads}."
+            )
+        gqa_ratio = num_heads // kv_heads
+        if gqa_ratio not in (1, 2, 4, 8, 16):
+            raise ValueError(
+                "AITER_QUANT_ATTN supports GQA ratios 1, 2, 4, 8, and 16; "
+                f"got ratio={gqa_ratio}."
+            )
         if qkv_layout is not None and qkv_layout.upper() not in _SUPPORTED_LAYOUTS:
             raise ValueError(
                 "AITER_QUANT_ATTN expects [B, S, H, D] tensors "
