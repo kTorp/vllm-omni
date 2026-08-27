@@ -17,7 +17,7 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 _REQUIRED_HEAD_DIM = 128
 _DEFAULT_FORMAT = "mxfp4"
-_SUPPORTED_FORMATS = frozenset({"f4f4", "f6f4", "i8fp8", "mxfp4", "mxfp6"})
+_SUPPORTED_FORMATS = frozenset({"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6"})
 _SUPPORTED_LAYOUTS = frozenset({"BSND", "BSHD"})
 
 
