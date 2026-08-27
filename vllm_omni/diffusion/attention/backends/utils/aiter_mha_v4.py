@@ -111,6 +111,50 @@ def _aiter_i8fp8_quantize_v_fake(
     )
 
 
+@torch.library.custom_op("vllm_omni::aiter_i8fp8_attention", mutates_args=())
+def _aiter_i8fp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+) -> torch.Tensor:
+    fp8_format = _aiter_native_fp8_format()
+    return _aiter_mha_v4_packed(
+        query,
+        key,
+        value,
+        q_descale,
+        k_descale,
+        v_descale,
+        _AiterAttentionFormat.INT8,
+        _AiterAttentionFormat.INT8,
+        fp8_format,
+        *_aiter_scale_modes_for_formats(
+            _AiterAttentionFormat.INT8,
+            _AiterAttentionFormat.INT8,
+            fp8_format,
+        ),
+    )
+
+
+@_aiter_i8fp8_attention.register_fake
+def _aiter_i8fp8_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+) -> torch.Tensor:
+    del key, q_descale, k_descale, v_descale
+    return query.new_empty(
+        (query.shape[0], query.shape[1], query.shape[2], value.shape[-1]),
+        dtype=torch.bfloat16,
+    )
+
+
 def _forward_i8fp8(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -127,22 +171,13 @@ def _forward_i8fp8(
     q_i8, q_descale = _aiter_i8fp8_quantize_q(query)
     k_i8, k_descale = _aiter_i8fp8_quantize_k(key)
     v_fp8, v_descale = _aiter_i8fp8_quantize_v(value)
-    fp8_format = _aiter_native_fp8_format()
-    return _aiter_mha_v4_packed(
+    return _aiter_i8fp8_attention(
         q_i8,
         k_i8,
         v_fp8,
         q_descale,
         k_descale,
         v_descale,
-        _AiterAttentionFormat.INT8,
-        _AiterAttentionFormat.INT8,
-        fp8_format,
-        *_aiter_scale_modes_for_formats(
-            _AiterAttentionFormat.INT8,
-            _AiterAttentionFormat.INT8,
-            fp8_format,
-        ),
     )
 
 
