@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compile-safe wrappers for AITER MHA v4 MX attention recipes."""
 
-import inspect
 from collections.abc import Callable
 
 import torch
-
-_HADAMARD_BLOCK_R = 128
 
 try:
     import aiter as _aiter
@@ -23,6 +20,9 @@ try:
     from aiter.ops.mha_v4 import quantize_mxfp6_k as _aiter_quantize_mxfp6_k
     from aiter.ops.mha_v4 import quantize_mxfp6_q as _aiter_quantize_mxfp6_q
     from aiter.ops.mha_v4 import quantize_fp8 as _aiter_mha_v4_quantize_fp8
+    from aiter.ops.mha_v4 import (
+        quantize_fp8_rotated as _aiter_mha_v4_quantize_fp8_rotated,
+    )
     from aiter.ops.mha_v4 import quantize_int8 as _aiter_mha_v4_quantize_int8
     from aiter.ops.mha_v4 import quantize_v_fp8 as _aiter_quantize_v_fp8
     from aiter.ops.mha_v4 import quantize_v_mxfp4 as _aiter_quantize_v_mxfp4
@@ -43,6 +43,7 @@ except ImportError as exc:
     _aiter_quantize_mxfp6_k = None
     _aiter_quantize_mxfp6_q = None
     _aiter_mha_v4_quantize_fp8 = None
+    _aiter_mha_v4_quantize_fp8_rotated = None
     _aiter_mha_v4_quantize_int8 = None
     _aiter_quantize_v_fp8 = None
     _aiter_quantize_v_mxfp4 = None
@@ -55,102 +56,6 @@ def require_mha_v4() -> None:
         raise RuntimeError(
             "AITER_QUANT_ATTN requires an AITER build containing aiter.ops.mha_v4."
         ) from _MHA_V4_IMPORT_ERROR
-
-
-def _build_hadamard_matrix(
-    block_r: int,
-    dtype: torch.dtype = torch.bfloat16,
-    allow_sylvester_fallback: bool = True,
-) -> torch.Tensor | None:
-    if block_r <= 0 or (block_r & (block_r - 1)) != 0:
-        raise ValueError("Hadamard block size must be a positive power of two.")
-
-    try:
-        try:
-            from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-                create_hadamard_matrix,
-            )
-        except ImportError:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-                create_hadamard_matrix,
-            )
-
-        return create_hadamard_matrix(block_r, dtype=dtype) / (block_r**0.5)
-    except ImportError:
-        if not allow_sylvester_fallback:
-            return None
-        matrix = torch.ones((1, 1), dtype=torch.float32)
-        while matrix.shape[0] < block_r:
-            matrix = torch.cat(
-                [
-                    torch.cat([matrix, matrix], dim=1),
-                    torch.cat([matrix, -matrix], dim=1),
-                ],
-                dim=0,
-            )
-        return (matrix / (block_r**0.5)).to(dtype)
-
-
-def _replicate_hadamard_per_device(
-    hadamard: torch.Tensor | None,
-) -> dict[torch.device, torch.Tensor | None]:
-    if torch.cuda.is_available():
-        devices = [torch.device(f"cuda:{index}") for index in range(torch.cuda.device_count())]
-    else:
-        devices = [torch.device("cpu")]
-    return {
-        device: hadamard.to(device) if hadamard is not None else None
-        for device in devices
-    }
-
-
-def _aiter_hadamard_matrix(
-    block_r: int,
-    dtype: torch.dtype = torch.bfloat16,
-    allow_sylvester_fallback: bool = True,
-) -> dict[torch.device, torch.Tensor | None]:
-    return _replicate_hadamard_per_device(
-        _build_hadamard_matrix(
-            block_r,
-            dtype=dtype,
-            allow_sylvester_fallback=allow_sylvester_fallback,
-        )
-    )
-
-
-FP8_HADAMARD_MATRIX = _aiter_hadamard_matrix(_HADAMARD_BLOCK_R)
-
-
-def _fp8_hadamard_rotate(
-    tensor: torch.Tensor,
-    hadamard: torch.Tensor | None,
-) -> torch.Tensor:
-    if hadamard is None:
-        return tensor
-    head_dim = tensor.shape[-1]
-    block_r = hadamard.shape[-1]
-    hadamard = hadamard.to(tensor.dtype)
-    if block_r == head_dim:
-        return torch.matmul(tensor, hadamard)
-    return torch.matmul(
-        tensor.unflatten(-1, (head_dim // block_r, block_r)),
-        hadamard,
-    ).flatten(-2)
-
-
-def _aiter_fp8_has_descale() -> bool:
-    try:
-        return (
-            inspect.signature(_aiter.flash_attn_fp8_pertensor_func).parameters.get(
-                "q_descale"
-            )
-            is not None
-        )
-    except (AttributeError, TypeError, ValueError):
-        return False
-
-
-AITER_FP8_HAS_DESCALE = _aiter_fp8_has_descale()
 
 
 @torch.library.custom_op("vllm_omni::aiter_fp8_attention", mutates_args=())
@@ -202,40 +107,13 @@ def _forward_fp8(
     causal: bool,
 ) -> torch.Tensor:
     del softmax_scale, causal
-    hadamard = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, hadamard).contiguous()
-    key = _fp8_hadamard_rotate(key, hadamard).contiguous()
+    query = query.contiguous()
+    key = key.contiguous()
     value = value.contiguous()
 
-    quant_dtype = _aiter.dtypes.fp8
-    dtype_max = torch.finfo(quant_dtype).max
-    scale = None
-    if not AITER_FP8_HAS_DESCALE:
-        scale = torch.tensor(1.0, dtype=torch.float32, device=query.device)
-
-    quant_q, q_descale = _aiter.per_tensor_quant(
-        query,
-        scale=scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=dtype_max,
-    )
-    quant_k, k_descale = _aiter.per_tensor_quant(
-        key,
-        scale=scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=dtype_max,
-    )
-    quant_v, v_descale = _aiter.per_tensor_quant(
-        value,
-        scale=scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=dtype_max,
-    )
-
-    if not AITER_FP8_HAS_DESCALE:
-        q_descale = torch.ones((1,), dtype=torch.float32, device=query.device)
-        k_descale = torch.ones((1,), dtype=torch.float32, device=query.device)
-        v_descale = torch.ones((1,), dtype=torch.float32, device=query.device)
+    quant_q, q_descale = _aiter_mha_v4_quantize_fp8_rotated(query)
+    quant_k, k_descale = _aiter_mha_v4_quantize_fp8_rotated(key)
+    quant_v, v_descale = _aiter_mha_v4_quantize_fp8(value)
 
     return _aiter_fp8_attention(
         quant_q,
