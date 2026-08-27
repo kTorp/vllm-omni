@@ -1619,7 +1619,7 @@ class AiterQuantSpec:
     """Typed configuration for the ROCm AITER quantized attention backend."""
 
     format: str = "mxfp4"
-    _VALID_FORMATS = frozenset({"f4f4", "f6f4", "mxfp4", "mxfp6"})
+    _VALID_FORMATS = frozenset({"f4f4", "f6f4", "i8fp8", "mxfp4", "mxfp6"})
 
     def __post_init__(self) -> None:
         self.format = str(self.format).lower()
