@@ -17,18 +17,26 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 _REQUIRED_HEAD_DIM = 128
 _DEFAULT_FORMAT = "mxfp4"
-_SUPPORTED_FORMATS = frozenset({"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6"})
+_FORMATS_BY_ARCH = {
+    "gfx942": frozenset({"fp8", "i8fp8"}),
+    "gfx950": frozenset({"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6"}),
+}
+_ALL_FORMATS = frozenset(
+    format_name
+    for supported_formats in _FORMATS_BY_ARCH.values()
+    for format_name in supported_formats
+)
 _SUPPORTED_LAYOUTS = frozenset({"BSND", "BSHD"})
 
 
-def _is_gfx95_supported() -> bool:
+def _get_gfx_arch() -> str | None:
     if torch.version.hip is None or not torch.cuda.is_available():
-        return False
+        return None
     try:
         arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
     except (AttributeError, RuntimeError):
-        return False
-    return "gfx95" in arch.lower()
+        return None
+    return arch.lower().split(":", 1)[0]
 
 
 class AiterQuantBackend(AttentionBackend):
@@ -36,8 +44,6 @@ class AiterQuantBackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
-        if not _is_gfx95_supported():
-            raise RuntimeError("AITER_QUANT_ATTN requires a gfx950-class ROCm GPU.")
         require_mha_v4()
 
     @staticmethod
@@ -76,10 +82,22 @@ class AiterQuantImpl(AttentionImpl):
     ) -> None:
         options = backend_kwargs or {}
         format_name = str(options.get("format", _DEFAULT_FORMAT)).lower()
-        if format_name not in _SUPPORTED_FORMATS:
+        if format_name not in _ALL_FORMATS:
             raise ValueError(
                 f"Unknown AITER quant format {format_name!r}; "
-                f"expected one of {sorted(_SUPPORTED_FORMATS)}."
+                f"expected one of {sorted(_ALL_FORMATS)}."
+            )
+        gfx_arch = _get_gfx_arch()
+        supported_formats = _FORMATS_BY_ARCH.get(gfx_arch)
+        if supported_formats is None:
+            raise RuntimeError(
+                "AITER_QUANT_ATTN requires a gfx942 or gfx950 ROCm GPU; "
+                f"detected {gfx_arch or 'unknown'}."
+            )
+        if format_name not in supported_formats:
+            raise RuntimeError(
+                f"AITER_QUANT_ATTN format={format_name!r} is not available on {gfx_arch}; "
+                f"use one of {sorted(supported_formats)}."
             )
         if causal:
             raise NotImplementedError("AITER_QUANT_ATTN does not support causal attention.")
