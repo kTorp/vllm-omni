@@ -9,6 +9,7 @@ import torch
 try:
     import aiter as _aiter
     from aiter.ops.mha_v4 import AttentionFormat as _AiterAttentionFormat
+    from aiter.ops.mha_v4 import AttentionScaleMode as _AiterAttentionScaleMode
     from aiter.ops.mha_v4 import mha_v4_packed as _aiter_mha_v4_packed
     from aiter.ops.mha_v4 import mha_v4_q_multiplier as _aiter_mha_v4_q_multiplier
     from aiter.ops.mha_v4 import mxfp4_k_view as _aiter_mxfp4_k_view
@@ -19,6 +20,8 @@ try:
     from aiter.ops.mha_v4 import quantize_mxfp4_q as _aiter_quantize_mxfp4_q
     from aiter.ops.mha_v4 import quantize_mxfp6_k as _aiter_quantize_mxfp6_k
     from aiter.ops.mha_v4 import quantize_mxfp6_q as _aiter_quantize_mxfp6_q
+    from aiter.ops.mha_v4 import quantize_mxfp8_k as _aiter_quantize_mxfp8_k
+    from aiter.ops.mha_v4 import quantize_mxfp8_q as _aiter_quantize_mxfp8_q
     from aiter.ops.mha_v4 import quantize_fp8 as _aiter_mha_v4_quantize_fp8
     from aiter.ops.mha_v4 import (
         quantize_fp8_rotated as _aiter_mha_v4_quantize_fp8_rotated,
@@ -32,6 +35,7 @@ try:
 except ImportError as exc:
     _aiter = None
     _AiterAttentionFormat = None
+    _AiterAttentionScaleMode = None
     _aiter_mha_v4_packed = None
     _aiter_mha_v4_q_multiplier = None
     _aiter_mxfp4_k_view = None
@@ -42,6 +46,8 @@ except ImportError as exc:
     _aiter_quantize_mxfp4_q = None
     _aiter_quantize_mxfp6_k = None
     _aiter_quantize_mxfp6_q = None
+    _aiter_quantize_mxfp8_k = None
+    _aiter_quantize_mxfp8_q = None
     _aiter_mha_v4_quantize_fp8 = None
     _aiter_mha_v4_quantize_fp8_rotated = None
     _aiter_mha_v4_quantize_int8 = None
@@ -122,6 +128,81 @@ def _forward_fp8(
         q_descale,
         k_descale,
         v_descale,
+    )
+
+
+@torch.library.custom_op("vllm_omni::aiter_mxfp8_attention", mutates_args=())
+def _aiter_mxfp8_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    fp8_format = _aiter_native_fp8_format()
+    return _aiter_mha_v4_packed(
+        query,
+        key,
+        value,
+        q_descale,
+        k_descale,
+        v_descale,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.E8M0_PER_1X32,
+        _AiterAttentionScaleMode.F32_PER_TENSOR,
+        softmax_scale=softmax_scale,
+    )
+
+
+@_aiter_mxfp8_attention.register_fake
+def _aiter_mxfp8_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    del key, q_descale, k_descale, v_descale, softmax_scale
+    return query.new_empty(
+        (query.shape[0], query.shape[1], query.shape[2], value.shape[-1]),
+        dtype=torch.bfloat16,
+    )
+
+
+def _forward_mxfp8(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    del causal
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
+    q_fp8, q_descale = _aiter_quantize_mxfp8_q(
+        query,
+        _aiter_mha_v4_q_multiplier(softmax_scale),
+    )
+    k_fp8, k_descale = _aiter_quantize_mxfp8_k(key)
+    v_fp8, v_descale = _aiter_mha_v4_quantize_fp8(value)
+    return _aiter_mxfp8_attention(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
     )
 
 
@@ -687,6 +768,7 @@ _FORWARD_FNS: dict[str, Callable[..., torch.Tensor]] = {
     "i8fp8": _forward_i8fp8,
     "mxfp4": _forward_mxfp4,
     "mxfp6": _forward_mxfp6,
+    "mxfp8": _forward_mxfp8,
 }
 
 
