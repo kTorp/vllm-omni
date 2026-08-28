@@ -20,7 +20,7 @@ _DEFAULT_FORMAT = "fp8"
 _FORMATS_BY_ARCH = {
     "gfx942": frozenset({"fp8", "i8fp8"}),
     "gfx950": frozenset(
-        {"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
+        {"bf16", "f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
     ),
 }
 _ALL_FORMATS = frozenset(

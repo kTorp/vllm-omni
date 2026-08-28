@@ -64,6 +64,63 @@ def require_mha_v4() -> None:
         ) from _MHA_V4_IMPORT_ERROR
 
 
+@torch.library.custom_op("vllm_omni::aiter_bf16_attention", mutates_args=())
+def _aiter_bf16_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return _aiter_mha_v4_packed(
+        query,
+        key,
+        value,
+        query,
+        key,
+        value,
+        _AiterAttentionFormat.BF16,
+        _AiterAttentionFormat.BF16,
+        _AiterAttentionFormat.BF16,
+        *_aiter_scale_modes_for_formats(
+            _AiterAttentionFormat.BF16,
+            _AiterAttentionFormat.BF16,
+            _AiterAttentionFormat.BF16,
+        ),
+        softmax_scale=softmax_scale,
+    )
+
+
+@_aiter_bf16_attention.register_fake
+def _aiter_bf16_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    del key, softmax_scale
+    return query.new_empty(
+        (query.shape[0], query.shape[1], query.shape[2], value.shape[-1]),
+        dtype=torch.bfloat16,
+    )
+
+
+def _forward_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    del causal
+    return _aiter_bf16_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        softmax_scale,
+    )
+
+
 @torch.library.custom_op("vllm_omni::aiter_fp8_attention", mutates_args=())
 def _aiter_fp8_attention(
     query: torch.Tensor,
@@ -762,6 +819,7 @@ def _forward_f6f4(
 
 
 _FORWARD_FNS: dict[str, Callable[..., torch.Tensor]] = {
+    "bf16": _forward_bf16,
     "f4f4": _forward_f4f4,
     "f6f4": _forward_f6f4,
     "fp8": _forward_fp8,

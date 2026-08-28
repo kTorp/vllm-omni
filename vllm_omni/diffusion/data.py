@@ -1620,7 +1620,7 @@ class AiterQuantSpec:
 
     format: str = "fp8"
     _VALID_FORMATS = frozenset(
-        {"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
+        {"bf16", "f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
     )
 
     def __post_init__(self) -> None:
