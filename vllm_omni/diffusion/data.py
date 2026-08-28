@@ -1618,7 +1618,7 @@ class AttnQuantSpec:
 class AiterQuantSpec:
     """Typed configuration for the ROCm AITER quantized attention backend."""
 
-    format: str = "mxfp4"
+    format: str = "fp8"
     _VALID_FORMATS = frozenset(
         {"f4f4", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
     )

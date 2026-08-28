@@ -16,7 +16,7 @@ from vllm_omni.diffusion.attention.backends.utils.aiter_mha_v4 import (
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 _REQUIRED_HEAD_DIM = 128
-_DEFAULT_FORMAT = "mxfp4"
+_DEFAULT_FORMAT = "fp8"
 _FORMATS_BY_ARCH = {
     "gfx942": frozenset({"fp8", "i8fp8"}),
     "gfx950": frozenset(
