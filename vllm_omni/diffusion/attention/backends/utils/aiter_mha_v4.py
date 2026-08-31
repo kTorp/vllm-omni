@@ -531,86 +531,6 @@ def _forward_mxfp4(
     )
 
 
-@torch.library.custom_op("vllm_omni::aiter_f4f4_kernel_raw", mutates_args=())
-def _aiter_f4f4_kernel_raw(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_buf: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_buf: torch.Tensor,
-    v_scale: torch.Tensor,
-    softmax_scale: float,
-    kv_len: int,
-) -> torch.Tensor:
-    k_fp4 = _aiter_mxfp4_k_view(k_buf, k_scale)
-    v_fp4 = _aiter_mxfp4_v_view(v_buf, v_scale, kv_len)
-    return _aiter_mha_v4_packed(
-        q_fp4,
-        k_fp4,
-        v_fp4,
-        q_scale,
-        k_scale,
-        v_scale,
-        _AiterAttentionFormat.MXFP4,
-        _AiterAttentionFormat.MXFP4,
-        _AiterAttentionFormat.MXFP4,
-        *_aiter_scale_modes_for_formats(
-            _AiterAttentionFormat.MXFP4,
-            _AiterAttentionFormat.MXFP4,
-            _AiterAttentionFormat.MXFP4,
-        ),
-        softmax_scale=softmax_scale,
-    )
-
-
-@_aiter_f4f4_kernel_raw.register_fake
-def _aiter_f4f4_kernel_raw_fake(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_buf: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_buf: torch.Tensor,
-    v_scale: torch.Tensor,
-    softmax_scale: float,
-    kv_len: int,
-) -> torch.Tensor:
-    del k_buf, k_scale, v_buf, v_scale, softmax_scale, kv_len
-    batch, seq_len, num_heads, _ = q_fp4.shape
-    return q_fp4.new_empty(
-        (batch, seq_len, num_heads, q_scale.shape[-1] * 32),
-        dtype=torch.bfloat16,
-    )
-
-
-def _forward_f4f4(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    *,
-    softmax_scale: float,
-    causal: bool,
-) -> torch.Tensor:
-    del softmax_scale, causal
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
-    softmax_scale = query.shape[-1] ** -0.5
-
-    q_fp4, q_scale = _aiter_mxfp4_quantize_q(query, softmax_scale)
-    k_buf, k_scale = _aiter_mxfp4_quantize_k_raw(key)
-    v_buf, v_scale = _aiter_f4_quantize_v_raw(value)
-    return _aiter_f4f4_kernel_raw(
-        q_fp4,
-        q_scale,
-        k_buf,
-        k_scale,
-        v_buf,
-        v_scale,
-        softmax_scale,
-        value.shape[1],
-    )
-
-
 @torch.library.custom_op("vllm_omni::aiter_mxfp6_quantize_q", mutates_args=())
 def _aiter_mxfp6_quantize_q(
     query: torch.Tensor,
@@ -820,7 +740,6 @@ def _forward_f6f4(
 
 _FORWARD_FNS: dict[str, Callable[..., torch.Tensor]] = {
     "bf16": _forward_bf16,
-    "f4f4": _forward_f4f4,
     "f6f4": _forward_f6f4,
     "fp8": _forward_fp8,
     "i8fp8": _forward_i8fp8,
