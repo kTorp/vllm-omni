@@ -223,6 +223,18 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
+    enable_combine_qkv_a2a: bool = True
+    """Global override for the combined QKV all-to-all optimization.
+
+    Acts as a kill switch: models opt in per-forward by setting
+    ``combine_qkv_a2a=True`` on their ``AttentionMetadata``, which fuses Q/K/V
+    into a single 5D tensor and performs one all-to-all collective instead of
+    three during the Ulysses pre-attention reshard, reducing NCCL overhead.
+    Only effective in strict mode when Q/K/V shapes match (i.e. no GQA).
+    Set to False to disable the optimization globally, even for models that
+    opt in.
+    """
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -824,6 +836,7 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    diffusion_compile_reorder_comm_overlap: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -918,6 +931,14 @@ class OmniDiffusionConfig:
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
+
+    # V3 BF16 conversion kernel variant for aiter flash attention on ROCm.
+    # Selects one of three pre-compiled assembly kernels:
+    #   0 = RTNE (round to nearest even, IEEE default)
+    #   1 = RTNA (round to nearest away, aiter API default)
+    #   2 = RTZ  (round to zero / truncate) — default
+    # On gfx950 the kernel falls back to RTNE regardless of this setting.
+    aiter_bf16_cvt_mode: int = 2
 
     # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
     # None = native dtype (no quantization).
@@ -1036,6 +1057,11 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_compile_reorder_comm_overlap, bool):
+            raise TypeError(
+                "diffusion_compile_reorder_comm_overlap must be a bool, "
+                f"got {type(self.diffusion_compile_reorder_comm_overlap)!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.diffusion_kv_max_rows_per_request is not None and (
             type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
