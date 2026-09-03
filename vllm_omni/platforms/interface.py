@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from enum import Enum
@@ -154,6 +154,11 @@ class OmniPlatform(Platform):
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def get_gfx_arch(cls) -> str | None:
+        """Return the ROCm gfx architecture, if applicable."""
+        return None
 
     @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:

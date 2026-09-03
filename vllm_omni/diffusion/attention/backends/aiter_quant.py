@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AITER MHA v4 quantized diffusion attention backend."""
 
 import torch
@@ -14,6 +14,7 @@ from vllm_omni.diffusion.attention.backends.utils.aiter_mha_v4 import (
     require_mha_v4,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.platforms import current_omni_platform
 
 _REQUIRED_HEAD_DIM = 128
 _DEFAULT_FORMAT = "fp8"
@@ -29,16 +30,6 @@ _ALL_FORMATS = frozenset(
     for format_name in supported_formats
 )
 _SUPPORTED_LAYOUTS = frozenset({"BSND", "BSHD"})
-
-
-def _get_gfx_arch() -> str | None:
-    if torch.version.hip is None or not torch.cuda.is_available():
-        return None
-    try:
-        arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
-    except (AttributeError, RuntimeError):
-        return None
-    return arch.lower().split(":", 1)[0]
 
 
 class AiterQuantBackend(AttentionBackend):
@@ -89,7 +80,7 @@ class AiterQuantImpl(AttentionImpl):
                 f"Unknown AITER quant format {format_name!r}; "
                 f"expected one of {sorted(_ALL_FORMATS)}."
             )
-        gfx_arch = _get_gfx_arch()
+        gfx_arch = current_omni_platform.get_gfx_arch()
         supported_formats = _FORMATS_BY_ARCH.get(gfx_arch)
         if supported_formats is None:
             raise RuntimeError(
