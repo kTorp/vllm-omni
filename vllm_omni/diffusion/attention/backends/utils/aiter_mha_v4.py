@@ -127,6 +127,7 @@ def _aiter_fp8_attention(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    softmax_scale: float,
 ) -> torch.Tensor:
     fp8_format = _aiter_native_fp8_format()
     return _aiter_mha_v4_packed(
@@ -140,6 +141,7 @@ def _aiter_fp8_attention(
         fp8_format,
         fp8_format,
         *_aiter_scale_modes_for_formats(fp8_format, fp8_format, fp8_format),
+        softmax_scale=softmax_scale,
     )
 
 
@@ -151,8 +153,9 @@ def _aiter_fp8_attention_fake(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    softmax_scale: float,
 ) -> torch.Tensor:
-    del key, q_descale, k_descale, v_descale
+    del key, q_descale, k_descale, v_descale, softmax_scale
     return query.new_empty(
         (query.shape[0], query.shape[1], query.shape[2], value.shape[-1]),
         dtype=torch.bfloat16,
@@ -167,7 +170,7 @@ def _forward_fp8(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale, causal
+    del causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -183,6 +186,7 @@ def _forward_fp8(
         q_descale,
         k_descale,
         v_descale,
+        softmax_scale,
     )
 
 
@@ -269,6 +273,7 @@ def _aiter_i8fp8_attention(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    softmax_scale: float,
 ) -> torch.Tensor:
     fp8_format = _aiter_native_fp8_format()
     return _aiter_mha_v4_packed(
@@ -286,6 +291,7 @@ def _aiter_i8fp8_attention(
             _AiterAttentionFormat.INT8,
             fp8_format,
         ),
+        softmax_scale=softmax_scale,
     )
 
 
@@ -297,8 +303,9 @@ def _aiter_i8fp8_attention_fake(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    softmax_scale: float,
 ) -> torch.Tensor:
-    del key, q_descale, k_descale, v_descale
+    del key, q_descale, k_descale, v_descale, softmax_scale
     return query.new_empty(
         (query.shape[0], query.shape[1], query.shape[2], value.shape[-1]),
         dtype=torch.bfloat16,
@@ -313,7 +320,7 @@ def _forward_i8fp8(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale, causal
+    del causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -328,6 +335,7 @@ def _forward_i8fp8(
         q_descale,
         k_descale,
         v_descale,
+        softmax_scale,
     )
 
 
@@ -388,11 +396,10 @@ def _forward_mxfp4(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale, causal
+    del causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-    softmax_scale = query.shape[-1] ** -0.5
 
     q_fp4, q_scale = _aiter_quantize_mxfp4_q(
         query,
@@ -475,11 +482,10 @@ def _forward_mxfp6(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale, causal
+    del causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-    softmax_scale = query.shape[-1] ** -0.5
 
     q_fp6, q_scale = _aiter_quantize_mxfp6_q(
         query,
@@ -564,11 +570,10 @@ def _forward_f6f4(
     softmax_scale: float,
     causal: bool,
 ) -> torch.Tensor:
-    del softmax_scale, causal
+    del causal
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-    softmax_scale = query.shape[-1] ** -0.5
 
     q_fp6, q_scale = _aiter_quantize_mxfp6_q(
         query,
