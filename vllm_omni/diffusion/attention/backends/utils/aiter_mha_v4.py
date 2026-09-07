@@ -7,7 +7,6 @@ from collections.abc import Callable
 import torch
 
 try:
-    import aiter as _aiter
     from aiter.ops.mha_v4 import AttentionFormat as _AiterAttentionFormat
     from aiter.ops.mha_v4 import AttentionScaleMode as _AiterAttentionScaleMode
     from aiter.ops.mha_v4 import mha_v4_packed as _aiter_mha_v4_packed
@@ -16,24 +15,23 @@ try:
     from aiter.ops.mha_v4 import mxfp4_v_view as _aiter_mxfp4_v_view
     from aiter.ops.mha_v4 import mxfp6_k_view as _aiter_mxfp6_k_view
     from aiter.ops.mha_v4 import native_fp8_format as _aiter_native_fp8_format
+    from aiter.ops.mha_v4 import quantize_fp8 as _aiter_mha_v4_quantize_fp8
+    from aiter.ops.mha_v4 import (
+        quantize_fp8_rotated as _aiter_mha_v4_quantize_fp8_rotated,
+    )
+    from aiter.ops.mha_v4 import quantize_int8 as _aiter_mha_v4_quantize_int8
     from aiter.ops.mha_v4 import quantize_mxfp4_k as _aiter_quantize_mxfp4_k
     from aiter.ops.mha_v4 import quantize_mxfp4_q as _aiter_quantize_mxfp4_q
     from aiter.ops.mha_v4 import quantize_mxfp6_k as _aiter_quantize_mxfp6_k
     from aiter.ops.mha_v4 import quantize_mxfp6_q as _aiter_quantize_mxfp6_q
     from aiter.ops.mha_v4 import quantize_mxfp8_k as _aiter_quantize_mxfp8_k
     from aiter.ops.mha_v4 import quantize_mxfp8_q as _aiter_quantize_mxfp8_q
-    from aiter.ops.mha_v4 import quantize_fp8 as _aiter_mha_v4_quantize_fp8
-    from aiter.ops.mha_v4 import (
-        quantize_fp8_rotated as _aiter_mha_v4_quantize_fp8_rotated,
-    )
-    from aiter.ops.mha_v4 import quantize_int8 as _aiter_mha_v4_quantize_int8
     from aiter.ops.mha_v4 import quantize_v_fp8 as _aiter_quantize_v_fp8
     from aiter.ops.mha_v4 import quantize_v_mxfp4 as _aiter_quantize_v_mxfp4
     from aiter.ops.mha_v4 import scale_modes_for_formats as _aiter_scale_modes_for_formats
 
     _MHA_V4_IMPORT_ERROR: ImportError | None = None
 except ImportError as exc:
-    _aiter = None
     _AiterAttentionFormat = None
     _AiterAttentionScaleMode = None
     _aiter_mha_v4_packed = None
@@ -263,63 +261,6 @@ def _forward_mxfp8(
     )
 
 
-@torch.library.custom_op("vllm_omni::aiter_i8fp8_quantize_q", mutates_args=())
-def _aiter_i8fp8_quantize_q(
-    query: torch.Tensor,
-    clip: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_mha_v4_quantize_int8(query, clip)
-
-
-@_aiter_i8fp8_quantize_q.register_fake
-def _aiter_i8fp8_quantize_q_fake(
-    query: torch.Tensor,
-    clip: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del clip
-    return query.new_empty(query.shape, dtype=torch.int8), query.new_empty(
-        (1,),
-        dtype=torch.float32,
-    )
-
-
-@torch.library.custom_op("vllm_omni::aiter_i8fp8_quantize_k", mutates_args=())
-def _aiter_i8fp8_quantize_k(
-    key: torch.Tensor,
-    clip: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_mha_v4_quantize_int8(key, clip)
-
-
-@_aiter_i8fp8_quantize_k.register_fake
-def _aiter_i8fp8_quantize_k_fake(
-    key: torch.Tensor,
-    clip: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del clip
-    return key.new_empty(key.shape, dtype=torch.int8), key.new_empty(
-        (1,),
-        dtype=torch.float32,
-    )
-
-
-@torch.library.custom_op("vllm_omni::aiter_i8fp8_quantize_v", mutates_args=())
-def _aiter_i8fp8_quantize_v(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_mha_v4_quantize_fp8(value)
-
-
-@_aiter_i8fp8_quantize_v.register_fake
-def _aiter_i8fp8_quantize_v_fake(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return value.new_empty(value.shape, dtype=_aiter.dtypes.fp8), value.new_empty(
-        (1,),
-        dtype=torch.float32,
-    )
-
-
 @torch.library.custom_op("vllm_omni::aiter_i8fp8_attention", mutates_args=())
 def _aiter_i8fp8_attention(
     query: torch.Tensor,
@@ -377,9 +318,9 @@ def _forward_i8fp8(
     key = key.contiguous()
     value = value.contiguous()
 
-    q_i8, q_descale = _aiter_i8fp8_quantize_q(query)
-    k_i8, k_descale = _aiter_i8fp8_quantize_k(key)
-    v_fp8, v_descale = _aiter_i8fp8_quantize_v(value)
+    q_i8, q_descale = _aiter_mha_v4_quantize_int8(query)
+    k_i8, k_descale = _aiter_mha_v4_quantize_int8(key)
+    v_fp8, v_descale = _aiter_mha_v4_quantize_fp8(value)
     return _aiter_i8fp8_attention(
         q_i8,
         k_i8,
@@ -388,70 +329,6 @@ def _forward_i8fp8(
         k_descale,
         v_descale,
     )
-
-
-@torch.library.custom_op("vllm_omni::aiter_mxfp4_quantize_q", mutates_args=())
-def _aiter_mxfp4_quantize_q(
-    query: torch.Tensor,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp4_q(
-        query,
-        _aiter_mha_v4_q_multiplier(softmax_scale),
-    )
-
-
-@_aiter_mxfp4_quantize_q.register_fake
-def _aiter_mxfp4_quantize_q_fake(
-    query: torch.Tensor,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp4_q(
-        query,
-        _aiter_mha_v4_q_multiplier(softmax_scale),
-    )
-
-
-@torch.library.custom_op("vllm_omni::aiter_mxfp4_quantize_k_raw", mutates_args=())
-def _aiter_mxfp4_quantize_k_raw(
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp4_k(key)
-
-
-@_aiter_mxfp4_quantize_k_raw.register_fake
-def _aiter_mxfp4_quantize_k_raw_fake(
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp4_k(key)
-
-
-@torch.library.custom_op("vllm_omni::aiter_mx_quantize_v", mutates_args=())
-def _aiter_mx_quantize_v(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_v_fp8(value)
-
-
-@_aiter_mx_quantize_v.register_fake
-def _aiter_mx_quantize_v_fake(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_v_fp8(value)
-
-
-@torch.library.custom_op("vllm_omni::aiter_f4_quantize_v_raw", mutates_args=())
-def _aiter_f4_quantize_v_raw(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_v_mxfp4(value)
-
-
-@_aiter_f4_quantize_v_raw.register_fake
-def _aiter_f4_quantize_v_raw_fake(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_v_mxfp4(value)
 
 
 @torch.library.custom_op("vllm_omni::aiter_mxfp4_kernel_raw", mutates_args=())
@@ -517,9 +394,12 @@ def _forward_mxfp4(
     value = value.contiguous()
     softmax_scale = query.shape[-1] ** -0.5
 
-    q_fp4, q_scale = _aiter_mxfp4_quantize_q(query, softmax_scale)
-    k_buf, k_scale = _aiter_mxfp4_quantize_k_raw(key)
-    v_fp8, v_scale = _aiter_mx_quantize_v(value)
+    q_fp4, q_scale = _aiter_quantize_mxfp4_q(
+        query,
+        _aiter_mha_v4_q_multiplier(softmax_scale),
+    )
+    k_buf, k_scale = _aiter_quantize_mxfp4_k(key)
+    v_fp8, v_scale = _aiter_quantize_v_fp8(value)
     return _aiter_mxfp4_kernel_raw(
         q_fp4,
         q_scale,
@@ -529,42 +409,6 @@ def _forward_mxfp4(
         v_scale,
         softmax_scale,
     )
-
-
-@torch.library.custom_op("vllm_omni::aiter_mxfp6_quantize_q", mutates_args=())
-def _aiter_mxfp6_quantize_q(
-    query: torch.Tensor,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp6_q(
-        query,
-        _aiter_mha_v4_q_multiplier(softmax_scale),
-    )
-
-
-@_aiter_mxfp6_quantize_q.register_fake
-def _aiter_mxfp6_quantize_q_fake(
-    query: torch.Tensor,
-    softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp6_q(
-        query,
-        _aiter_mha_v4_q_multiplier(softmax_scale),
-    )
-
-
-@torch.library.custom_op("vllm_omni::aiter_mxfp6_quantize_k_raw", mutates_args=())
-def _aiter_mxfp6_quantize_k_raw(
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp6_k(key)
-
-
-@_aiter_mxfp6_quantize_k_raw.register_fake
-def _aiter_mxfp6_quantize_k_raw_fake(
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _aiter_quantize_mxfp6_k(key)
 
 
 @torch.library.custom_op("vllm_omni::aiter_mxfp6_kernel_raw", mutates_args=())
@@ -637,9 +481,12 @@ def _forward_mxfp6(
     value = value.contiguous()
     softmax_scale = query.shape[-1] ** -0.5
 
-    q_fp6, q_scale = _aiter_mxfp6_quantize_q(query, softmax_scale)
-    k_buf, k_scale_buf = _aiter_mxfp6_quantize_k_raw(key)
-    v_fp8, v_scale = _aiter_mx_quantize_v(value)
+    q_fp6, q_scale = _aiter_quantize_mxfp6_q(
+        query,
+        _aiter_mha_v4_q_multiplier(softmax_scale),
+    )
+    k_buf, k_scale_buf = _aiter_quantize_mxfp6_k(key)
+    v_fp8, v_scale = _aiter_quantize_v_fp8(value)
     return _aiter_mxfp6_kernel_raw(
         k_buf,
         k_scale_buf,
@@ -723,9 +570,12 @@ def _forward_f6f4(
     value = value.contiguous()
     softmax_scale = query.shape[-1] ** -0.5
 
-    q_fp6, q_scale = _aiter_mxfp6_quantize_q(query, softmax_scale)
-    k_buf, k_scale_buf = _aiter_mxfp6_quantize_k_raw(key)
-    v_buf, v_scale = _aiter_f4_quantize_v_raw(value)
+    q_fp6, q_scale = _aiter_quantize_mxfp6_q(
+        query,
+        _aiter_mha_v4_q_multiplier(softmax_scale),
+    )
+    k_buf, k_scale_buf = _aiter_quantize_mxfp6_k(key)
+    v_buf, v_scale = _aiter_quantize_v_mxfp4(value)
     return _aiter_f6f4_kernel_raw(
         k_buf,
         k_scale_buf,
