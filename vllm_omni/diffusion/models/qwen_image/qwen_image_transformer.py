@@ -66,6 +66,14 @@ def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
 
 
+def _split_text_embed_in_sp_from_extras(od_config) -> bool:
+    extras = getattr(od_config, "extras", None) or {}
+    value = extras.get(_SPLIT_TEXT_EMBED_EXTRA, False)
+    if not isinstance(value, bool):
+        raise TypeError(f"{_SPLIT_TEXT_EMBED_EXTRA} must be a bool, got {type(value)!r}")
+    return value
+
+
 def _normalize_qwen_image_weight_name(name: str) -> str:
     name = name.removeprefix("transformer.")
     if ".to_out.0." in name:
@@ -1014,8 +1022,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
-        extras = getattr(od_config, "extras", None) or {}
-        self.split_text_embed_in_sp = bool(extras.get(_SPLIT_TEXT_EMBED_EXTRA, False))
+        self.split_text_embed_in_sp = _split_text_embed_in_sp_from_extras(od_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
