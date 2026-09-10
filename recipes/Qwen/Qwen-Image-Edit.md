@@ -103,8 +103,8 @@ python examples/offline_inference/image_to_image/image_edit.py \
 
 Validated reference numbers for 1024×1024, 50 denoising steps, batch size 1, `guidance_scale=1.0`, seed 42 (`Cold` = first request after startup, `Warm` = identical subsequent request):
 
-| Cold latency | Warm latency | Peak GPU memory |
-| ---:         | ---:         | ---:            |
+| Cold latency | Warm latency | Peak GPU memory         |
+| ---:         | ---:         | ---:                    |
 | 17.80 s      | 17.78 s      | 61,091 MiB (~59.66 GiB) |
 
 ##### Notes
@@ -131,8 +131,8 @@ Run the same `curl` command as in the **1x H200** Verification section above aga
 
 Same workload as the 1x table above (1024×1024, 50 steps, `guidance_scale=1.0`, seed 42):
 
-| Configuration | Cold latency | Warm latency | Peak per-GPU memory |
-| ---           | ---:         | ---:         | ---:                |
+| Configuration | Cold latency | Warm latency | Peak per-GPU memory     |
+| ---           | ---:         | ---:         | ---:                    |
 | 1x H200       | 17.80 s      | 17.78 s      | 61,091 MiB (~59.66 GiB) |
 | 2x H200 TP=2  | 11.16 s      | 11.09 s      | 49,377 MiB (~48.22 GiB) |
 
