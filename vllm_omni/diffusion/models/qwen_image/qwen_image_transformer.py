@@ -66,7 +66,7 @@ def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
 
 
-def _split_text_embed_in_sp_from_extras(od_config) -> bool:
+def _split_text_embed_in_sp_from_extras(od_config: OmniDiffusionConfig) -> bool:
     extras = getattr(od_config, "extras", None) or {}
     value = extras.get(_SPLIT_TEXT_EMBED_EXTRA, False)
     if not isinstance(value, bool):
@@ -129,8 +129,9 @@ class ImageRopePrepare(nn.Module):
             vid_freqs: Image RoPE frequencies [img_seq_len, rope_dim]
             txt_freqs: Text RoPE frequencies [txt_seq_len, rope_dim]
 
-        Note: _sp_plan will shard hidden_states and vid_freqs via split_output=True
-              txt_freqs is kept replicated for dual-stream attention
+        Note: _sp_plan shards hidden_states and vid_freqs via split_output=True.
+              txt_freqs remains replicated unless forward() applies the
+              split-text opt-in.
         """
         # Apply input projection
         hidden_states = self.img_in(hidden_states)
