@@ -74,6 +74,24 @@ def _split_text_embed_in_sp_from_extras(od_config: OmniDiffusionConfig) -> bool:
     return value
 
 
+def _pad_text_inputs_for_sp(
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_mask: torch.Tensor | None,
+    txt_seq_lens: list[int] | None,
+    sp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, list[int] | None]:
+    txt_pad_size = -encoder_hidden_states.shape[1] % sp_size
+    if txt_pad_size == 0:
+        return encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens
+
+    encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, txt_pad_size))
+    if encoder_hidden_states_mask is not None:
+        encoder_hidden_states_mask = F.pad(encoder_hidden_states_mask, (0, txt_pad_size), value=True)
+    # txt_freqs is sliced to max(txt_seq_lens), which must cover the padding.
+    txt_seq_lens = [encoder_hidden_states.shape[1]]
+    return encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens
+
+
 def _normalize_qwen_image_weight_name(name: str) -> str:
     name = name.removeprefix("transformer.")
     if ".to_out.0." in name:
@@ -1158,13 +1176,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
         sp_size = self.parallel_config.sequence_parallel_size
         split_text_embed = sp_size > 1 and self.split_text_embed_in_sp
         if split_text_embed:
-            txt_pad_size = -encoder_hidden_states.shape[1] % sp_size
-            if txt_pad_size > 0:
-                encoder_hidden_states = F.pad(encoder_hidden_states, (0, 0, 0, txt_pad_size))
-                if encoder_hidden_states_mask is not None:
-                    encoder_hidden_states_mask = F.pad(encoder_hidden_states_mask, (0, txt_pad_size), value=True)
-                # txt_freqs is sliced to max(txt_seq_lens), which must cover the padding.
-                txt_seq_lens = [encoder_hidden_states.shape[1]]
+            encoder_hidden_states, encoder_hidden_states_mask, txt_seq_lens = _pad_text_inputs_for_sp(
+                encoder_hidden_states,
+                encoder_hidden_states_mask,
+                txt_seq_lens,
+                sp_size,
+            )
 
             get_forward_context().split_text_embed_in_sp = True
             encoder_hidden_states = sp_shard(encoder_hidden_states, dim=1)
