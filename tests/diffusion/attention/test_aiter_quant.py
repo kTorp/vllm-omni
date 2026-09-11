@@ -181,9 +181,7 @@ def test_missing_aiter_reports_actionable_error(monkeypatch):
     )
 
     def unavailable():
-        raise RuntimeError(
-            "AITER_QUANT_ATTN requires an AITER build containing aiter.ops.mha_v4."
-        )
+        raise RuntimeError("AITER_QUANT_ATTN requires an AITER build containing aiter.ops.mha_v4.")
 
     monkeypatch.setattr(aiter_quant, "require_mha_v4", unavailable)
 

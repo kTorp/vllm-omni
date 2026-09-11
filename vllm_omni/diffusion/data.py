@@ -1826,16 +1826,13 @@ class AiterQuantSpec:
     """Typed configuration for the ROCm AITER quantized attention backend."""
 
     format: str = "fp8"
-    _VALID_FORMATS = frozenset(
-        {"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
-    )
+    _VALID_FORMATS = frozenset({"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"})
 
     def __post_init__(self) -> None:
         self.format = str(self.format).lower()
         if self.format not in self._VALID_FORMATS:
             raise ValueError(
-                f"aiter_quant.format={self.format!r} unsupported; "
-                f"use one of {sorted(self._VALID_FORMATS)}."
+                f"aiter_quant.format={self.format!r} unsupported; use one of {sorted(self._VALID_FORMATS)}."
             )
 
 
@@ -1923,8 +1920,7 @@ class AttentionSpec:
             self.aiter_quant = self.aiter_quant or AiterQuantSpec()
         elif self.aiter_quant is not None:
             raise ValueError(
-                "aiter_quant is only supported by the AITER_QUANT_ATTN backend, "
-                f"but backend={self.backend!r}."
+                f"aiter_quant is only supported by the AITER_QUANT_ATTN backend, but backend={self.backend!r}."
             )
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":

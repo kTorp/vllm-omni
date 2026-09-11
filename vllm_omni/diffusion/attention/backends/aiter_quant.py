@@ -20,14 +20,10 @@ _REQUIRED_HEAD_DIM = 128
 _DEFAULT_FORMAT = "fp8"
 _FORMATS_BY_ARCH = {
     "gfx942": frozenset({"fp8", "i8fp8"}),
-    "gfx950": frozenset(
-        {"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}
-    ),
+    "gfx950": frozenset({"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}),
 }
 _ALL_FORMATS = frozenset(
-    format_name
-    for supported_formats in _FORMATS_BY_ARCH.values()
-    for format_name in supported_formats
+    format_name for supported_formats in _FORMATS_BY_ARCH.values() for format_name in supported_formats
 )
 _SUPPORTED_LAYOUTS = frozenset({"BSND", "BSHD"})
 
@@ -76,16 +72,12 @@ class AiterQuantImpl(AttentionImpl):
         options = backend_kwargs or {}
         format_name = str(options.get("format", _DEFAULT_FORMAT)).lower()
         if format_name not in _ALL_FORMATS:
-            raise ValueError(
-                f"Unknown AITER quant format {format_name!r}; "
-                f"expected one of {sorted(_ALL_FORMATS)}."
-            )
+            raise ValueError(f"Unknown AITER quant format {format_name!r}; expected one of {sorted(_ALL_FORMATS)}.")
         gfx_arch = current_omni_platform.get_gfx_arch()
-        supported_formats = _FORMATS_BY_ARCH.get(gfx_arch)
+        supported_formats = _FORMATS_BY_ARCH.get(gfx_arch) if gfx_arch is not None else None
         if supported_formats is None:
             raise RuntimeError(
-                "AITER_QUANT_ATTN requires a gfx942 or gfx950 ROCm GPU; "
-                f"detected {gfx_arch or 'unknown'}."
+                f"AITER_QUANT_ATTN requires a gfx942 or gfx950 ROCm GPU; detected {gfx_arch or 'unknown'}."
             )
         if format_name not in supported_formats:
             raise RuntimeError(
@@ -95,9 +87,7 @@ class AiterQuantImpl(AttentionImpl):
         if causal:
             raise NotImplementedError("AITER_QUANT_ATTN does not support causal attention.")
         if head_size != _REQUIRED_HEAD_DIM:
-            raise NotImplementedError(
-                f"AITER_QUANT_ATTN requires head_dim={_REQUIRED_HEAD_DIM}; got {head_size}."
-            )
+            raise NotImplementedError(f"AITER_QUANT_ATTN requires head_dim={_REQUIRED_HEAD_DIM}; got {head_size}.")
         kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         if num_heads <= 0 or kv_heads <= 0:
             raise ValueError(
@@ -111,21 +101,14 @@ class AiterQuantImpl(AttentionImpl):
             )
         gqa_ratio = num_heads // kv_heads
         if gqa_ratio not in (1, 2, 4, 8, 16):
-            raise ValueError(
-                "AITER_QUANT_ATTN supports GQA ratios 1, 2, 4, 8, and 16; "
-                f"got ratio={gqa_ratio}."
-            )
+            raise ValueError(f"AITER_QUANT_ATTN supports GQA ratios 1, 2, 4, 8, and 16; got ratio={gqa_ratio}.")
         if qkv_layout is not None and qkv_layout.upper() not in _SUPPORTED_LAYOUTS:
             raise ValueError(
-                "AITER_QUANT_ATTN expects [B, S, H, D] tensors "
-                f"(BSND/BSHD), not qkv_layout={qkv_layout!r}."
+                f"AITER_QUANT_ATTN expects [B, S, H, D] tensors (BSND/BSHD), not qkv_layout={qkv_layout!r}."
             )
         config = get_current_diffusion_config_or_none()
         if config is not None and config.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError(
-                "AITER_QUANT_ATTN requires float16 or bfloat16 model inputs; "
-                f"got dtype={config.dtype}."
-            )
+            raise TypeError(f"AITER_QUANT_ATTN requires float16 or bfloat16 model inputs; got dtype={config.dtype}.")
 
         AiterQuantBackend.validate_available()
         self.format = format_name
