@@ -74,7 +74,7 @@ if current_omni_platform.is_rocm():
 
             flash_attn_func = _fa_func
             flash_attn_varlen_func = _fa_varlen
-            
+
             HAS_AITER_FLASH_ATTN = True
     except (ImportError, ModuleNotFoundError):
         pass
