@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -1179,7 +1182,13 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # ``gate_proj``/``up_proj`` → ``gate_up_proj``. ``default_weight_loader``
         # alone leaves those fused params un-initialised, which silently turns
         # the backbone into a slightly-corrupted model that never emits EOS.
+        # The local depth transformer (shared ``CodePredictorBaseModel``) has
+        # the exact same hazard: its ``qkv_proj``/``gate_up_proj`` are fused,
+        # so its shards must go through ``CodePredictorBaseModel.load_weights``
+        # (via ``MossTTSRealtimeLocalTransformer.load_weights``), which re-packs
+        # them and raises on incomplete/missing fused parameters.
         backbone_weights: list[tuple[str, torch.Tensor]] = []
+        local_weights: list[tuple[str, torch.Tensor]] = []
         skipped: list[str] = []
         for name, tensor in weights:
             if name.startswith("language_model."):
@@ -1194,8 +1203,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     continue  # non-persistent buffer, recomputed at runtime
                 if sub.startswith("embed_tokens."):
                     sub = "codec_embedding." + sub[len("embed_tokens.") :]
-                tgt = "local_transformer.model." + sub
-            elif name.startswith("local_transformer.local_lm_heads."):
+                local_weights.append((f"model.{sub}", tensor))
+                continue
+            if name.startswith("local_transformer.local_lm_heads."):
                 tgt = "local_lm_heads." + name[len("local_transformer.local_lm_heads.") :]
             else:
                 tgt = name
@@ -1209,6 +1219,11 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         backbone_loaded = self.model.load_weights(iter(backbone_weights))
         for n in backbone_loaded:
             loaded.add(f"model.{n}")
+
+        # Delegate depth-transformer weights to the shared fused loader.
+        local_loaded = self.local_transformer.load_weights(iter(local_weights))
+        for n in local_loaded:
+            loaded.add(f"local_transformer.{n}")
 
         # Build stacked embedding cache for vectorised decode ops.
         # embed_tokens[0] is the text embedding; [1..n_vq] are audio codebooks.
@@ -1659,20 +1674,19 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
         self._batch_state_spans = kwargs.get("request_token_spans")
-        should_values: list[torch.Tensor] = []
-        have_mtp_output = False
+        should_codes: list[torch.Tensor] = []
+        should_indices: list[int] = []
         per_req_codes: list[torch.Tensor] = []
         have_codes = False
-        for info in info_dicts:
+        for index, info in enumerate(info_dicts):
             audio_codes = (info.get("audio_codes", {}) or {}) if isinstance(info, dict) else {}
             current = audio_codes.pop("current", None)
             if isinstance(current, torch.Tensor) and current.numel() > 0:
                 codes = current.to(device=hidden.device, dtype=torch.long)
                 if codes.dim() == 1:
                     codes = codes.unsqueeze(0)
-                should_continue = codes.ne(self.audio_pad_token_id).any(dim=-1)
-                should_values.append(should_continue.reshape(-1)[:1])
-                have_mtp_output = True
+                should_codes.append(codes[:1])
+                should_indices.append(index)
                 # Do not boolean-index a CUDA tensor here.  Even for the
                 # common single-row case, ``codes[should_continue]`` must
                 # discover a dynamic output size on the host and therefore
@@ -1682,9 +1696,19 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 per_req_codes.append(codes)
                 have_codes = True
             else:
-                should_values.append(torch.ones((1,), device=hidden.device, dtype=torch.bool))
                 per_req_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))
-        self._batch_should_continue = torch.cat(should_values, dim=0) if have_mtp_output and should_values else None
+        self._batch_should_continue = None
+        if should_codes:
+            active = torch.cat(should_codes, dim=0).ne(self.audio_pad_token_id).any(dim=-1)
+            if len(should_codes) == len(info_dicts):
+                self._batch_should_continue = active
+            else:
+                self._batch_should_continue = torch.ones(len(info_dicts), device=hidden.device, dtype=torch.bool)
+                # Keep mixed prefill/decode output packing asynchronous.
+                indices = torch.tensor(should_indices, device="cpu", dtype=torch.long).to(
+                    hidden.device, non_blocking=True
+                )
+                self._batch_should_continue.index_copy_(0, indices, active)
 
         if not have_codes:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
