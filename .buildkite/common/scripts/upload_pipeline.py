@@ -13,12 +13,14 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
 Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
     (string/list keys from ci_source_file_dependencies.yml, or inline path
-    prefixes). Filtering applies on **PR label** uploads only; ``main`` + env
-    schedule (NIGHTLY/WEEKLY/merge push) keeps every job and still strips the field.
-    If no job-key prefix matches, a change to the pipeline YAML being uploaded
-    or to a path under the ``source_filter_fallback`` registry key keeps every
-    job so command, env, and hardware edits can be validated before merge.
-    When any job-key prefix already matches, normal filtering wins.
+    prefixes). Filtering applies on **PR label** uploads and on post-merge
+    ``main`` L3 uploads. Scheduled ``main`` uploads that pass ``--all``
+    (NIGHTLY/WEEKLY) or ``--e2e`` keep every selected job and still strip
+    the field. If no job-key prefix matches, a change to the pipeline YAML
+    being uploaded or to a path under the ``source_filter_fallback`` registry
+    key keeps every job so command, env, and hardware edits can be validated
+    before merge. When any job-key prefix already matches, normal filtering
+    wins.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
@@ -100,6 +102,7 @@ CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_depe
 SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
 CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
 CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
 
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
@@ -618,11 +621,11 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
     if any(preset_name == chip or preset_name.startswith(f"{chip}_") for chip in _cuda_mirror_chips()):
         commands = merged.get("commands")
         if isinstance(commands, list):
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, *commands]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, *commands]
         elif commands is None:
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, commands]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
     # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
     if "retry" in step:
         merged["retry"] = step["retry"]
@@ -780,16 +783,13 @@ def _changed_files_for_source_filter(
 ) -> list[str] | None:
     """Return the diff to filter against, or None to keep every step.
 
-    ``source_file_dependencies`` is label-only: scheduled ``main`` uploads
-    (NIGHTLY/WEEKLY/post-merge) run the full pipeline. ``--all`` / ``--e2e``
-    also disable filtering. Pipeline YAML / ``source_filter_fallback`` matches
-    are applied later in ``_render_test_pipeline`` only when no job-key prefix
-    already matched.
+    ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
+    uploads and weekly E2E sweeps). Post-merge ``main`` L3 and PR-label
+    uploads filter against the commit/PR diff. Pipeline YAML /
+    ``source_filter_fallback`` matches are applied later in
+    ``_render_test_pipeline`` only when no job-key prefix already matched.
     """
     if force_all or e2e_only:
-        return None
-    if os.environ.get("BUILDKITE_BRANCH", "") == "main":
-        _log("main branch: keep all jobs (source_file_dependencies is label-only)")
         return None
     return ctx.changed_files
 
