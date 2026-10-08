@@ -668,8 +668,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
-            HAS_AITER_FLASH_ATTN,
             HAS_FLASH_ATTN,
+            IS_AITER,
             IS_FLASH_ATTN_4,
             flash_attn_func,
             flash_attn_varlen_func,
@@ -757,7 +757,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "softmax_scale": self.softmax_scale,
             }
 
-            if HAS_AITER_FLASH_ATTN:
+            if IS_AITER:
                 mode = 2  # RTZ, Round Towards Zero
                 if is_forward_context_available():
                     cfg = get_forward_context().omni_diffusion_config
