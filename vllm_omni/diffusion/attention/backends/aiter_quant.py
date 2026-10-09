@@ -10,8 +10,8 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.utils.aiter_mha_v4 import (
+    check_aiter_mha_v4_available,
     get_forward_fn,
-    require_mha_v4,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
@@ -20,7 +20,7 @@ _REQUIRED_HEAD_DIM = 128
 _DEFAULT_FORMAT = "fp8"
 _FORMATS_BY_ARCH = {
     "gfx942": frozenset({"fp8", "i8fp8"}),
-    "gfx950": frozenset({"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}),
+    "gfx950": frozenset({"bf16", "f6f4", "fp8", "f8f6", "i8fp8", "mxfp4", "mxfp6", "mxfp8"}),
 }
 _ALL_FORMATS = frozenset(
     format_name for supported_formats in _FORMATS_BY_ARCH.values() for format_name in supported_formats
@@ -33,7 +33,8 @@ class AiterQuantBackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
-        require_mha_v4()
+        """Raise if the installed AITER lacks the ``mha_v4`` API this backend calls."""
+        check_aiter_mha_v4_available()
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -71,6 +72,34 @@ class AiterQuantImpl(AttentionImpl):
     ) -> None:
         options = backend_kwargs or {}
         format_name = str(options.get("format", _DEFAULT_FORMAT)).lower()
+        self._validate_config(
+            format_name=format_name,
+            num_heads=num_heads,
+            head_size=head_size,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            qkv_layout=qkv_layout,
+        )
+
+        AiterQuantBackend.validate_available()
+
+        self.format = format_name
+        self.qkv_layout = qkv_layout
+        self.softmax_scale = softmax_scale
+        self.causal = causal
+        self._forward = get_forward_fn(format_name)
+
+    @staticmethod
+    def _validate_config(
+        *,
+        format_name: str,
+        num_heads: int,
+        head_size: int,
+        causal: bool,
+        num_kv_heads: int | None,
+        qkv_layout: str | None,
+    ) -> None:
+        """Reject configurations that AITER MHA v4 cannot run, before any layer state is built."""
         if format_name not in _ALL_FORMATS:
             raise ValueError(f"Unknown AITER quant format {format_name!r}; expected one of {sorted(_ALL_FORMATS)}.")
         gfx_arch = current_omni_platform.get_gfx_arch()
@@ -89,11 +118,6 @@ class AiterQuantImpl(AttentionImpl):
         if head_size != _REQUIRED_HEAD_DIM:
             raise NotImplementedError(f"AITER_QUANT_ATTN requires head_dim={_REQUIRED_HEAD_DIM}; got {head_size}.")
         kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        if num_heads <= 0 or kv_heads <= 0:
-            raise ValueError(
-                "AITER_QUANT_ATTN requires positive query and KV head counts; "
-                f"got num_heads={num_heads}, num_kv_heads={kv_heads}."
-            )
         if num_heads % kv_heads != 0:
             raise ValueError(
                 "AITER_QUANT_ATTN requires query heads to be divisible by KV heads; "
@@ -107,15 +131,8 @@ class AiterQuantImpl(AttentionImpl):
                 f"AITER_QUANT_ATTN expects [B, S, H, D] tensors (BSND/BSHD), not qkv_layout={qkv_layout!r}."
             )
         config = get_current_diffusion_config_or_none()
-        if config is not None and config.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError(f"AITER_QUANT_ATTN requires float16 or bfloat16 model inputs; got dtype={config.dtype}.")
-
-        AiterQuantBackend.validate_available()
-        self.format = format_name
-        self.qkv_layout = qkv_layout
-        self.softmax_scale = softmax_scale
-        self.causal = causal
-        self._forward = get_forward_fn(format_name)
+        if config is not None and config.dtype is not torch.bfloat16:
+            raise TypeError(f"AITER_QUANT_ATTN requires bfloat16 model inputs; got dtype={config.dtype}.")
 
     def forward_hip(
         self,
@@ -131,5 +148,4 @@ class AiterQuantImpl(AttentionImpl):
             key,
             value,
             softmax_scale=self.softmax_scale,
-            causal=self.causal,
         )

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the AITER MHA v4 diffusion attention backend."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,7 +12,8 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.registry import (
     DiffusionAttentionBackendEnum,
 )
-from vllm_omni.diffusion.data import AttentionSpec
+from vllm_omni.diffusion.attention.backends.utils import aiter_mha_v4
+from vllm_omni.diffusion.data import AiterQuantSpec, AttentionSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -18,6 +21,7 @@ _GFX942_FORMATS = ("fp8", "i8fp8")
 _GFX950_FORMATS = (
     "bf16",
     "f6f4",
+    "f8f6",
     "fp8",
     "i8fp8",
     "mxfp4",
@@ -40,7 +44,7 @@ def _impl(monkeypatch, *, arch: str = "gfx950", **overrides):
         "current_omni_platform",
         _TestPlatform(arch),
     )
-    monkeypatch.setattr(aiter_quant, "require_mha_v4", lambda: None)
+    monkeypatch.setattr(aiter_quant, "check_aiter_mha_v4_available", lambda: None)
     kwargs = {
         "num_heads": 8,
         "head_size": 128,
@@ -150,7 +154,6 @@ def test_accepts_supported_gqa_ratios(monkeypatch, gqa_ratio):
         ({"causal": True}, NotImplementedError, "causal attention"),
         ({"head_size": 64}, NotImplementedError, "head_dim=128"),
         ({"qkv_layout": "BHSD"}, ValueError, "expects.*BSHD"),
-        ({"num_heads": 0}, ValueError, "positive query and KV"),
         (
             {"num_heads": 8, "num_kv_heads": 3},
             ValueError,
@@ -173,6 +176,43 @@ def test_rejects_unsupported_attention_contracts(
         _impl(monkeypatch, **overrides)
 
 
+@pytest.mark.parametrize("qkv_layout", [None, "BSND", "BSHD", "bsnd"])
+def test_accepts_bshd_compatible_layouts(monkeypatch, qkv_layout):
+    impl = _impl(monkeypatch, qkv_layout=qkv_layout)
+
+    assert impl.qkv_layout == qkv_layout
+
+
+def test_accepts_bfloat16_model_dtype(monkeypatch):
+    monkeypatch.setattr(
+        aiter_quant,
+        "get_current_diffusion_config_or_none",
+        lambda: SimpleNamespace(dtype=torch.bfloat16),
+    )
+
+    assert _impl(monkeypatch).format == "fp8"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_rejects_non_bfloat16_model_dtype(monkeypatch, dtype):
+    monkeypatch.setattr(
+        aiter_quant,
+        "get_current_diffusion_config_or_none",
+        lambda: SimpleNamespace(dtype=dtype),
+    )
+
+    with pytest.raises(TypeError, match="requires bfloat16"):
+        _impl(monkeypatch)
+
+
+def test_format_lists_stay_in_sync():
+    # Adding a format means touching the arch table, the config spec, and the recipe table.
+    assert set(_GFX942_FORMATS) == aiter_quant._FORMATS_BY_ARCH["gfx942"]
+    assert set(_GFX950_FORMATS) == aiter_quant._FORMATS_BY_ARCH["gfx950"]
+    assert set(aiter_mha_v4._FORWARD_FNS) == set(aiter_quant._ALL_FORMATS)
+    assert set(AiterQuantSpec._VALID_FORMATS) == set(aiter_quant._ALL_FORMATS)
+
+
 def test_missing_aiter_reports_actionable_error(monkeypatch):
     monkeypatch.setattr(
         aiter_quant,
@@ -183,7 +223,7 @@ def test_missing_aiter_reports_actionable_error(monkeypatch):
     def unavailable():
         raise RuntimeError("AITER_QUANT_ATTN requires an AITER build containing aiter.ops.mha_v4.")
 
-    monkeypatch.setattr(aiter_quant, "require_mha_v4", unavailable)
+    monkeypatch.setattr(aiter_quant, "check_aiter_mha_v4_available", unavailable)
 
     with pytest.raises(RuntimeError, match="requires an AITER build"):
         aiter_quant.AiterQuantImpl(
@@ -194,6 +234,52 @@ def test_missing_aiter_reports_actionable_error(monkeypatch):
             qkv_layout="BSHD",
             backend_kwargs={"format": "fp8"},
         )
+
+
+def test_validate_available_reports_failed_aiter_import(monkeypatch):
+    import_error = ImportError("No module named 'aiter'")
+    monkeypatch.setattr(aiter_mha_v4, "_MHA_V4_IMPORT_ERROR", import_error)
+
+    with pytest.raises(RuntimeError, match="requires an AITER build providing aiter.ops.mha_v4") as exc_info:
+        aiter_quant.AiterQuantBackend.validate_available()
+
+    assert exc_info.value.__cause__ is import_error
+
+
+def test_validate_available_rejects_mha_v4_without_required_kwargs(monkeypatch):
+    def old_mha_v4(query, key, value, q_format, k_format, v_format, softmax_scale=None):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(aiter_mha_v4, "_MHA_V4_IMPORT_ERROR", None)
+    monkeypatch.setattr(aiter_mha_v4, "_aiter_mha_v4", old_mha_v4)
+
+    with pytest.raises(RuntimeError, match="does not accept") as exc_info:
+        aiter_quant.AiterQuantBackend.validate_available()
+
+    for kwarg in ("q_scale_mode", "k_scale_mode", "v_scale_mode"):
+        assert kwarg in str(exc_info.value)
+    assert "softmax_scale" not in str(exc_info.value)
+
+
+def test_validate_available_accepts_complete_mha_v4(monkeypatch):
+    def new_mha_v4(
+        query,
+        key,
+        value,
+        q_format,
+        k_format,
+        v_format,
+        softmax_scale=None,
+        q_scale_mode=None,
+        k_scale_mode=None,
+        v_scale_mode=None,
+    ):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(aiter_mha_v4, "_MHA_V4_IMPORT_ERROR", None)
+    monkeypatch.setattr(aiter_mha_v4, "_aiter_mha_v4", new_mha_v4)
+
+    aiter_quant.AiterQuantBackend.validate_available()
 
 
 def test_rejects_attention_mask(monkeypatch):

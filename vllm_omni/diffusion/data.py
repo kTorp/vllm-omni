@@ -2005,7 +2005,7 @@ class AiterQuantSpec:
     """Typed configuration for the ROCm AITER quantized attention backend."""
 
     format: str = "fp8"
-    _VALID_FORMATS = frozenset({"bf16", "f6f4", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"})
+    _VALID_FORMATS = frozenset({"bf16", "f6f4", "f8f6", "fp8", "i8fp8", "mxfp4", "mxfp6", "mxfp8"})
 
     def __post_init__(self) -> None:
         self.format = str(self.format).lower()

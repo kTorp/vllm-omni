@@ -14,8 +14,11 @@ Selecting `AITER_QUANT_ATTN` requires:
 
 - a ROCm environment;
 - a gfx942 or gfx950 GPU;
-- `head_dim=128`; and
-- an AITER build containing `aiter.ops.mha_v4`.
+- `head_dim=128`;
+- a `bfloat16` model dtype; and
+- an AITER build that includes
+  [ROCm/aiter#5335](https://github.com/ROCm/aiter/pull/5335) or newer, which
+  provides the `aiter.ops.mha_v4` scale-mode API and the FP6/FP4 recipes.
 
 An incompatible explicit selection raises an error instead of silently
 falling back to another backend.
@@ -25,7 +28,7 @@ falling back to another backend.
 | Architecture | Formats |
 | --- | --- |
 | gfx942 | `fp8`, `i8fp8` |
-| gfx950 | `bf16`, `fp8`, `i8fp8`, `mxfp8`, `mxfp4`, `mxfp6`, `f6f4` |
+| gfx950 | `bf16`, `fp8`, `i8fp8`, `mxfp8`, `mxfp4`, `mxfp6`, `f6f4`, `f8f6` |
 
 The default format is `fp8`.
 
@@ -83,20 +86,6 @@ backend for masked or causal attention.
 Ulysses sequence parallelism is supported because its Q/K/V exchange completes
 before the selected local attention backend runs. Ring attention uses a
 separate ring kernel and does not execute `AITER_QUANT_ATTN`.
-
-## Compilation and troubleshooting
-
-The quantization and packed-layout boundaries are registered as custom
-operators for `torch.compile`. To isolate compilation-related behavior, disable
-compilation with:
-
-```bash
-vllm-omni serve <model> --enforce-eager ...
-```
-
-If backend initialization reports that `aiter.ops.mha_v4` is missing, update
-or rebuild AITER. If a format is rejected, verify the active GPU architecture
-against the format matrix above.
 
 ## Quality considerations
 
