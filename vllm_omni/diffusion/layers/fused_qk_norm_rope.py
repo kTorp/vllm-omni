@@ -30,7 +30,6 @@ from importlib.util import find_spec
 import torch
 import torch.nn.functional as F
 from torch.library import Library
-from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -395,7 +394,7 @@ def _fused_cuda_supported(
 ) -> bool:
     if not (
         HAS_TRITON
-        and current_platform.is_cuda()
+        and current_omni_platform.is_cuda_alike()
         and q.is_cuda
         and k.is_cuda
         and q.dtype == torch.bfloat16
