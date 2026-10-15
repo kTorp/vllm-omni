@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
 
 
+_SKIP_RUNTIME_FINITE_CHECKS = os.environ.get("VLLM_OMNI_MINIMAX_H3_SKIP_FINITE_CHECKS", "0") == "1"
+
+
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
+    if _SKIP_RUNTIME_FINITE_CHECKS:
+        return
     if not bool(torch.isfinite(tensor).all().item()):
         raise ValueError(f"{name} must be finite")
 
@@ -17,6 +23,8 @@ def _validate_unit_timestep(timestep: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be a torch.Tensor")
     if not torch.is_floating_point(timestep):
         raise ValueError(f"{name} must be a floating point tensor")
+    if _SKIP_RUNTIME_FINITE_CHECKS:
+        return
     _require_finite_tensor(timestep, name)
     out_of_range = (timestep < 0) | (timestep > 1)
     if bool(out_of_range.any().item()):
@@ -37,6 +45,8 @@ def _validate_timestep_sigma_pair(
     sigma_curr: float,
     name: str,
 ) -> float:
+    if _SKIP_RUNTIME_FINITE_CHECKS:
+        return _validate_sigma(sigma_curr, f"{name}_sigma_curr")
     _validate_unit_timestep(timestep, f"{name}_timestep")
     sigma = _validate_sigma(sigma_curr, f"{name}_sigma_curr")
     expected = 1.0 - timestep.detach().to(dtype=torch.float32)
