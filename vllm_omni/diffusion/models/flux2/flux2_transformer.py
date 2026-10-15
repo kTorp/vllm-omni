@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+import os
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 if TYPE_CHECKING:
@@ -45,6 +47,47 @@ logger = init_logger(__name__)
 
 def _join_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
+
+
+_USE_FUSED_QK_NORM_ROPE = os.environ.get("VLLM_OMNI_USE_FUSED_QK_NORM_ROPE", "0") == "1"
+
+
+def _flux2_qk_norm_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    norm_q: RMSNorm,
+    norm_k: RMSNorm,
+    rope: RotaryEmbedding,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Flux.2 Q/K norm + interleaved RoPE, optionally fused."""
+    if not _USE_FUSED_QK_NORM_ROPE or image_rotary_emb is None:
+        query = norm_q(query)
+        key = norm_k(key)
+        return apply_rope_to_qk(rope, query, key, image_rotary_emb)
+
+    cos, sin = (value.to(query.dtype) for value in image_rotary_emb)
+    rope_table = torch.cat([cos, sin], dim=-1)
+    batch_size = query.shape[0]
+    query_shape = query.shape
+    key_shape = key.shape
+    query = query.reshape(-1, query.shape[-2], query.shape[-1])
+    key = key.reshape(-1, key.shape[-2], key.shape[-1])
+    if rope_table.shape[0] != query.shape[0]:
+        rope_table = rope_table.repeat(batch_size, 1)
+
+    query, key = fused_qk_norm_rope(
+        query,
+        key,
+        norm_q.weight,
+        norm_k.weight,
+        rope_table,
+        norm_q.variance_epsilon,
+        head_dim=query_shape[-1],
+        rotary_dim=rope_table.shape[-1],
+        interleaved=True,
+    )
+    return query.reshape(query_shape), key.reshape(key_shape)
 
 
 class Flux2SwiGLU(nn.Module):
@@ -209,16 +252,10 @@ class Flux2Attention(nn.Module):
         key = key.unflatten(-1, (self.kv_num_heads, -1))
         value = value.unflatten(-1, (self.kv_num_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.add_kv_num_heads, -1))
-
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
 
             sp_size = self.parallel_config.sequence_parallel_size
             use_sp_joint_attention = (
@@ -227,20 +264,27 @@ class Flux2Attention(nn.Module):
                 and is_forward_context_available()
                 and not get_forward_context().split_text_embed_in_sp
             )
-
-            if use_sp_joint_attention and image_rotary_emb is not None:
+            txt_len = encoder_query.shape[1]
+            txt_rope = img_rope = None
+            if image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
                 cos = cos.to(query.dtype)
                 sin = sin.to(query.dtype)
-                txt_len = encoder_query.shape[1]
-                txt_cos, img_cos = cos[:txt_len], cos[txt_len:]
-                txt_sin, img_sin = sin[:txt_len], sin[txt_len:]
+                txt_rope = (cos[:txt_len], sin[:txt_len])
+                img_rope = (cos[txt_len:], sin[txt_len:])
+            query, key = _flux2_qk_norm_rope(
+                query, key, self.norm_q, self.norm_k, self.rope, img_rope
+            )
+            encoder_query, encoder_key = _flux2_qk_norm_rope(
+                encoder_query,
+                encoder_key,
+                self.norm_added_q,
+                self.norm_added_k,
+                self.rope,
+                txt_rope,
+            )
 
-                query = self.rope(query, img_cos, img_sin)
-                key = self.rope(key, img_cos, img_sin)
-                encoder_query = self.rope(encoder_query, txt_cos, txt_sin)
-                encoder_key = self.rope(encoder_key, txt_cos, txt_sin)
-
+            if use_sp_joint_attention and image_rotary_emb is not None:
                 attn_metadata = AttentionMetadata(
                     joint_query=encoder_query,
                     joint_key=encoder_key,
@@ -268,8 +312,6 @@ class Flux2Attention(nn.Module):
                 key = torch.cat([encoder_key, key], dim=1)
                 value = torch.cat([encoder_value, value], dim=1)
 
-                query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
-
                 attn_metadata = None
                 if attention_mask is not None:
                     if attention_mask.dim() == 3:
@@ -286,7 +328,9 @@ class Flux2Attention(nn.Module):
                 )
                 encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
         else:
-            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
+            query, key = _flux2_qk_norm_rope(
+                query, key, self.norm_q, self.norm_k, self.rope, image_rotary_emb
+            )
 
             attn_metadata = None
             if attention_mask is not None:
@@ -388,9 +432,6 @@ class Flux2ParallelSelfAttention(nn.Module):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
         sp_size = self.parallel_config.sequence_parallel_size
         text_seq_len = kwargs.get("text_seq_len", None)
         use_sp_single_stream = (
@@ -415,10 +456,22 @@ class Flux2ParallelSelfAttention(nn.Module):
             text_key = key[:, :text_seq_len]
             text_value = value[:, :text_seq_len]
 
-            img_query = self.rope(img_query, img_cos, img_sin)
-            img_key = self.rope(img_key, img_cos, img_sin)
-            text_query = self.rope(text_query, txt_cos, txt_sin)
-            text_key = self.rope(text_key, txt_cos, txt_sin)
+            img_query, img_key = _flux2_qk_norm_rope(
+                img_query,
+                img_key,
+                self.norm_q,
+                self.norm_k,
+                self.rope,
+                (img_cos, img_sin),
+            )
+            text_query, text_key = _flux2_qk_norm_rope(
+                text_query,
+                text_key,
+                self.norm_q,
+                self.norm_k,
+                self.rope,
+                (txt_cos, txt_sin),
+            )
 
             attn_metadata = AttentionMetadata(
                 joint_query=text_query,
@@ -436,7 +489,9 @@ class Flux2ParallelSelfAttention(nn.Module):
 
             attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
         else:
-            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
+            query, key = _flux2_qk_norm_rope(
+                query, key, self.norm_q, self.norm_k, self.rope, image_rotary_emb
+            )
 
             attn_metadata = AttentionMetadata(combine_qkv_a2a=True)
             if attention_mask is not None:
