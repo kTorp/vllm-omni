@@ -1331,6 +1331,8 @@ class MiniMaxH3DiTModel(nn.Module):
         self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
+        self._packed_position_cache_key = None
+        self._packed_position_cache = None
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
@@ -1649,15 +1651,41 @@ class MiniMaxH3DiTModel(nn.Module):
         local_end = local_start + local_len
         local_only = local_len != seq_len
         if local_only:
-            img_mask = (img_pos >= local_start) & (img_pos < local_end)
-            audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
-            text_mask = (text_pos >= local_start) & (text_pos < local_end)
-            img_global_pos = img_pos[img_mask]
-            audio_global_pos = audio_pos[audio_mask]
-            img_local_pos = img_global_pos - local_start
-            audio_local_pos = audio_global_pos - local_start
-            text_local_pos = text_pos[text_mask] - local_start
-            text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
+            cache_key = (
+                seq_len,
+                local_start,
+                local_len,
+                img_pos.data_ptr(),
+                audio_pos.data_ptr(),
+                text_pos.data_ptr(),
+            )
+            if cache_key != self._packed_position_cache_key:
+                img_mask = (img_pos >= local_start) & (img_pos < local_end)
+                audio_mask = (audio_pos >= local_start) & (audio_pos < local_end)
+                text_mask = (text_pos >= local_start) & (text_pos < local_end)
+                img_global_pos = img_pos[img_mask]
+                audio_global_pos = audio_pos[audio_mask]
+                img_local_pos = img_global_pos - local_start
+                audio_local_pos = audio_global_pos - local_start
+                text_local_pos = text_pos[text_mask] - local_start
+                text_local_indices = torch.nonzero(text_mask, as_tuple=False).view(-1)
+                self._packed_position_cache_key = cache_key
+                self._packed_position_cache = (
+                    img_global_pos,
+                    audio_global_pos,
+                    img_local_pos,
+                    audio_local_pos,
+                    text_local_pos,
+                    text_local_indices,
+                )
+            (
+                img_global_pos,
+                audio_global_pos,
+                img_local_pos,
+                audio_local_pos,
+                text_local_pos,
+                text_local_indices,
+            ) = self._packed_position_cache
         else:
             img_global_pos = img_pos
             audio_global_pos = audio_pos
