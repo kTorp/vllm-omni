@@ -7,8 +7,8 @@ import math
 
 import torch
 
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_dense_with_lse
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 from .ring_globals import (
     HAS_AITER,
