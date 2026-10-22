@@ -47,6 +47,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -124,6 +125,32 @@ def _from_pipeline_key(
     )
 
 
+@pytest.mark.parametrize("pending", [False, True])
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    pipeline = PipelineConfig(
+        model_type="test_pending_generation",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                supports_pending_generation=pending,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model="test-model")
+    assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
+
+
 def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
     config = _from_pipeline_key(
         "mammoth_moda2",
@@ -155,6 +182,49 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "placement", "expected"),
+    [
+        ("duplex", {}, 11),
+        ("duplex", {"replica_policy": "legacy"}, 11),
+        ("duplex", {"replica_policy": "legacy", "max_sessions_per_replica": 3}, 11),
+        ("duplex", {"replica_policy": "least_sessions", "max_sessions_per_replica": 3}, 3),
+        ("turn", {}, 1),
+    ],
+)
+def test_duplex_worker_capacity_matches_both_config_build_paths(session_mode, placement, expected) -> None:
+    pipeline = PipelineConfig(
+        model_type="test-duplex-replica-capacity",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="ar"),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        session_mode=session_mode,
+        duplex_session=DuplexSessionRuntimeConfig(max_sessions=11, **placement),
+        stages=[StageDeployConfig(stage_id=stage, num_replicas=2) for stage in (0, 1)],
+    )
+
+    # The legacy merge returns StageConfig; engine_args is exposed by its
+    # config-only projection, which does not resolve or initialize workers.
+    legacy_stages = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+    assert [stage.engine_args.get("duplex_max_sessions", 1) for stage in legacy_stages] == [expected, expected]
+    assert [stage.engine_args.session_mode for stage in legacy_stages] == [session_mode, session_mode]
+    assert [stage.model_config.duplex_max_sessions for stage in structured.stage_configs] == [expected, expected]
+    assert [stage.model_config.session_mode for stage in structured.stage_configs] == [session_mode, session_mode]
+    # Placement does not reinterpret the global frontend admission limit.
+    assert deploy.duplex_session.max_sessions == 11
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -489,7 +559,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
         # 32-entry pool covers the shape space.
@@ -1108,6 +1178,7 @@ def test_sub_config_fields_match_structured_scopes():
         "media_io_kwargs",
         "final_output",
         "supports_running_prefix_cache_reset",
+        "supports_pending_generation",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
