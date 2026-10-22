@@ -169,6 +169,19 @@ def _flash_attention_execution_path(
     )
 
 
+_SINGLE_DOCUMENT_CU_SEQLENS: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _single_document_cu_seqlens(length: int, device: torch.device) -> torch.Tensor:
+    """Cached ``[0, length]`` int32 cumulative lengths, so no layer pays a host-to-device copy."""
+    cache_key = (device, length)
+    cu = _SINGLE_DOCUMENT_CU_SEQLENS.get(cache_key)
+    if cu is None:
+        cu = torch.tensor([0, length], dtype=torch.int32, device=device)
+        _SINGLE_DOCUMENT_CU_SEQLENS[cache_key] = cu
+    return cu
+
+
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
@@ -181,7 +194,7 @@ class FlashAttentionBackend(AttentionBackend):
         # npu_attn_varlen opt-in and rebuilds the padding mask itself if the
         # packed contract fails. XPU reads attn_mask, so models must keep
         # constructing it there.
-        return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_npu()
 
     @classmethod
     def supports_multi_doc_packed_varlen(cls) -> bool:
@@ -513,6 +526,71 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         out = self._unwrap_flash_output(out)
         return out.reshape_as(query)
 
+    def _single_document_padding_length(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        metadata_plan: _FlashAttentionMetadataPlan,
+    ) -> int | None:
+        """Valid K/V prefix length when a [real, pad] packing can run as one document.
+
+        The producer-validated ``PackedPaddingMetadata`` states that the valid
+        rows are the prefix ``[0, kv_length)``. Padding rows never feed valid
+        rows, so the real rows can attend over one K/V document while the
+        padding queries just ride along (the xDiT layout). A second tiny
+        document makes the varlen kernel launch an extra, almost empty batch
+        entry and measured about 5% slower on MI350X.
+        """
+        packed_padding = None if attn_metadata is None else attn_metadata.packed_padding
+        if packed_padding is None or metadata_plan.packing_mode is not PackingMode.PACKED_PADDING or self.causal:
+            return None
+        valid = packed_padding.kv_length
+        total = query.shape[1]
+        if (
+            query.shape[0] != 1
+            or key.shape[0] != 1
+            or value.shape[0] != 1
+            or key.shape[1] != total
+            or value.shape[1] != total
+            # Local query shards (AllGather-KV) narrow q_length below kv_length.
+            or packed_padding.q_length != valid
+            or not 0 < valid < total
+        ):
+            return None
+        return valid
+
+    def _forward_varlen_single_document(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        valid_length: int,
+    ) -> torch.Tensor:
+        """Attend every query row over the single valid K/V document ``[0, valid_length)``."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
+        if flash_attn_varlen_func is None:
+            raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
+        total = query.shape[1]
+        out = flash_attn_varlen_func(
+            q=query.flatten(0, 1),
+            k=key[:, :valid_length].flatten(0, 1),
+            v=value[:, :valid_length].flatten(0, 1),
+            cu_seqlens_q=_single_document_cu_seqlens(total, query.device),
+            cu_seqlens_k=_single_document_cu_seqlens(valid_length, query.device),
+            max_seqlen_q=total,
+            max_seqlen_k=valid_length,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        out = self._unwrap_flash_output(out)
+        return out.reshape_as(query)
+
     def _forward_varlen_dense(
         self,
         query: torch.Tensor,
@@ -716,6 +794,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         if metadata_plan.packing_mode is not PackingMode.NONE:
             self._warn_fa_deterministic_non_dense("packed-varlen")
+            padded_length = self._single_document_padding_length(query, key, value, attn_metadata, metadata_plan)
+            if padded_length is not None:
+                return self._forward_varlen_single_document(query, key, value, valid_length=padded_length)
             return self._forward_varlen_packed(
                 query,
                 key,

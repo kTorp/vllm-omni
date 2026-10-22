@@ -746,6 +746,65 @@ def test_rocm_contract_multiple_packed_documents(rocm_contract):
     assert packed.call_args.kwargs["cu_seqlens_k"] is cu
 
 
+def _padded_packing_metadata(*, q_length=5, kv_length=5):
+    from vllm_omni.diffusion.attention.backends.abstract import PackedPaddingMetadata
+
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    return AttentionMetadata(
+        packed_padding=PackedPaddingMetadata(
+            q_length=q_length,
+            kv_length=kv_length,
+            cu_seqlens_q=cu[:2],
+            cu_seqlens_k=cu[:2],
+        ),
+        extra={"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5},
+    )
+
+
+@pytest.mark.cpu
+def test_rocm_contract_padded_packing_runs_as_single_document(rocm_contract):
+    impl, query, dense, packed = rocm_contract
+    key = torch.randn_like(query)
+    impl.forward_hip(query, key, key, _padded_packing_metadata())
+    dense.assert_not_called()
+    packed.assert_called_once()
+    kwargs = packed.call_args.kwargs
+    # Every query row rides along; keys and values stop at the valid prefix.
+    assert kwargs["q"].shape == (8, 2, 4)
+    assert kwargs["k"].shape == (5, 2, 4)
+    torch.testing.assert_close(kwargs["k"], key[0, :5])
+    assert kwargs["cu_seqlens_q"].tolist() == [0, 8]
+    assert kwargs["cu_seqlens_k"].tolist() == [0, 5]
+    assert (kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]) == (8, 5)
+
+
+@pytest.mark.cpu
+def test_rocm_contract_padded_packing_reuses_cu_seqlens_tensors(rocm_contract):
+    impl, query, _dense, packed = rocm_contract
+    impl.forward_hip(query, query, query, _padded_packing_metadata())
+    first = packed.call_args.kwargs
+    impl.forward_hip(query, query, query, _padded_packing_metadata())
+    second = packed.call_args.kwargs
+    assert first["cu_seqlens_q"] is second["cu_seqlens_q"]
+    assert first["cu_seqlens_k"] is second["cu_seqlens_k"]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("q_length", [5, 3])
+def test_rocm_contract_padded_packing_keeps_two_documents_when_not_a_plain_prefix(rocm_contract, q_length):
+    impl, query, _dense, packed = rocm_contract
+    # Without the producer's PackedPaddingMetadata, or with a local query shard
+    # (q_length != kv_length), the original two-document cu_seqlens is used.
+    metadata = _padded_packing_metadata(q_length=q_length)
+    if q_length == 5:
+        metadata.packed_padding = None
+    impl.forward_hip(query, query, query, metadata)
+    kwargs = packed.call_args.kwargs
+    assert kwargs["cu_seqlens_q"].tolist() == [0, 5, 8]
+    assert kwargs["q"].shape == (8, 2, 4)
+    assert kwargs["k"].shape == (8, 2, 4)
+
+
 @pytest.mark.cpu
 def test_rocm_contract_unknown_mask_stays_runtime_dependent(rocm_contract, monkeypatch):
     impl, query, dense, packed = rocm_contract
