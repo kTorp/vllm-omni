@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-import os
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -49,9 +48,6 @@ def _join_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
-_USE_FUSED_QK_NORM_ROPE = os.environ.get("VLLM_OMNI_USE_FUSED_QK_NORM_ROPE", "0") == "1"
-
-
 def _flux2_qk_norm_rope(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -60,8 +56,13 @@ def _flux2_qk_norm_rope(
     rope: RotaryEmbedding,
     image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Flux.2 Q/K norm + interleaved RoPE, optionally fused."""
-    if not _USE_FUSED_QK_NORM_ROPE or image_rotary_emb is None:
+    """Apply Flux.2 Q/K norm + interleaved RoPE with the shared fused op.
+
+    ``fused_qk_norm_rope`` dispatches to the Triton/NPU kernel where one is
+    supported and to its own eager implementation elsewhere, so no opt-in is
+    needed. Without rotary embeddings there is nothing to fuse.
+    """
+    if image_rotary_emb is None:
         query = norm_q(query)
         key = norm_k(key)
         return apply_rope_to_qk(rope, query, key, image_rotary_emb)
