@@ -99,6 +99,70 @@ def _pad_zimage_attention_heads(
     return query, key, value, original_head_count
 
 
+class _RefinerSequence(nn.Module):
+    """Identity boundary that lets ``_sp_plan`` shard or gather one refiner sequence.
+
+    xDiT pads and chunks the noise refiner and the context refiner independently,
+    runs every layer of that group on the local shard, then all-gathers before the
+    two sequences are concatenated. One instance is the split boundary and another
+    is the gather boundary. The gather returns hidden states, the mask, and both
+    RoPE tensors together: the refiner layer itself only returns hidden states,
+    and ``unified_prepare`` indexes the mask and RoPE with the original lengths.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hidden_states, attn_mask, cos, sin
+
+
+def _refiner_sp_outputs(shard_group: str) -> tuple[SequenceParallelOutput, ...]:
+    return (
+        SequenceParallelOutput(gather_dim=1, expected_dims=3, shard_group=shard_group),
+        SequenceParallelOutput(gather_dim=1, expected_dims=2, shard_group=shard_group),
+        SequenceParallelOutput(gather_dim=1, expected_dims=3, shard_group=shard_group),
+        SequenceParallelOutput(gather_dim=1, expected_dims=3, shard_group=shard_group),
+    )
+
+
+def _zimage_refiner_sp_plan(n_refiner_layers: int) -> dict:
+    """Shard each refiner group, then gather it before unification.
+
+    Hidden states, the attention mask, and both RoPE tensors share one sequence,
+    so they use one ``shard_group``. Noise and context are separate sequences and
+    therefore separate groups. An empty refiner stack is left unsharded.
+    """
+    if n_refiner_layers <= 0:
+        return {}
+
+    def _inputs(shard_group: str) -> dict[int, SequenceParallelInput]:
+        return {
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=3, split_output=True, auto_pad=True, shard_group=shard_group
+            ),
+            1: SequenceParallelInput(
+                split_dim=1, expected_dims=2, split_output=True, auto_pad=True, shard_group=shard_group
+            ),
+            2: SequenceParallelInput(
+                split_dim=1, expected_dims=3, split_output=True, auto_pad=True, shard_group=shard_group
+            ),
+            3: SequenceParallelInput(
+                split_dim=1, expected_dims=3, split_output=True, auto_pad=True, shard_group=shard_group
+            ),
+        }
+
+    return {
+        "noise_refiner_sequence": _inputs("zimage_noise_refiner"),
+        "noise_refiner_gather": _refiner_sp_outputs("zimage_noise_refiner"),
+        "context_refiner_sequence": _inputs("zimage_context_refiner"),
+        "context_refiner_gather": _refiner_sp_outputs("zimage_context_refiner"),
+    }
+
+
 class UnifiedPrepare(nn.Module):
     """Prepares unified tensors for transformer blocks.
 
@@ -589,6 +653,31 @@ class ZImageTransformerBlock(nn.Module):
         return x
 
 
+class ZImageNoiseRefinerBlock(ZImageTransformerBlock):
+    """Noise-refiner copy of the compiled block.
+
+    Regional compilation caches ``forward`` per code object. Keeping this
+    override separate stops the noise refiner's sequence length from spending
+    the shared 8-entry cache that the 30 main layers need.
+    """
+
+    def forward(self, x, attn_mask, cos, sin, adaln_input=None):
+        return super().forward(x, attn_mask, cos, sin, adaln_input)
+
+
+class ZImageContextRefinerBlock(ZImageTransformerBlock):
+    """Context-refiner copy of the compiled block.
+
+    This group calls ``forward`` with ``adaln_input=None``. On the shared
+    block that is a Dynamo type change, and with refiner sequence parallelism
+    it pushes the cache past ``recompile_limit`` before the real main-block
+    shape is compiled. The main layers then run eager for the whole warmup.
+    """
+
+    def forward(self, x, attn_mask, cos, sin, adaln_input=None):
+        return super().forward(x, attn_mask, cos, sin, adaln_input)
+
+
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels, quant_config: "QuantizationConfig | None" = None):
         super().__init__()
@@ -679,16 +768,17 @@ class ZImageTransformer2DModel(CachedTransformer):
 
     Sequence Parallelism:
         This model supports non-intrusive SP via _sp_plan. The plan specifies:
-        - Input splitting at first main transformer block (unified sequence)
+        - Sequence splitting around ``noise_refiner`` and ``context_refiner``
+        - Gathering each refiner group before the image and caption sequences are unified
+        - Input splitting of the unified sequence at ``unified_prepare``
         - RoPE (cos/sin) splitting along sequence dimension
         - Attention mask splitting along sequence dimension
         - Output gathering at final_layer
 
-        The SP is applied to the main `layers` transformer blocks where the
-        unified image+caption sequence is processed jointly.
-
-        Note: noise_refiner and context_refiner are NOT parallelized as they
-        process image and caption separately before unification.
+        The refiner groups follow xDiT: each group is padded and chunked on its own
+        sequence, every layer in the group runs on that shard, and the shard is
+        all-gathered before unification. The main ``layers`` then run on the
+        unified image+caption sequence.
 
         Important: The default _sp_plan assumes patch_size=2 and f_patch_size=1.
         If using different patch configurations, update _sp_plan accordingly.
@@ -705,7 +795,11 @@ class ZImageTransformer2DModel(CachedTransformer):
         "w13": ["w1", "w3"],
     }
 
-    _repeated_blocks = ["ZImageTransformerBlock"]
+    _repeated_blocks = [
+        "ZImageTransformerBlock",
+        "ZImageNoiseRefinerBlock",
+        "ZImageContextRefinerBlock",
+    ]
     _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod
@@ -719,6 +813,9 @@ class ZImageTransformer2DModel(CachedTransformer):
     # Z-Image uses `unified_prepare` module's split_output to shard unified tensors.
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
+    # - noise_refiner_sequence / context_refiner_sequence: shard each refiner group
+    #   (added per instance when n_refiner_layers > 0; gathered at the matching
+    #   noise_refiner_gather / context_refiner_gather boundary)
     # - unified_prepare: Split all 4 outputs (unified, cos, sin, attn_mask) via split_output=True
     # - layers.0: hidden_states input is already sharded from unified_prepare output
     # - all_final_layer.2-1: Gather outputs after the final layer
@@ -828,7 +925,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         self.all_final_layer = nn.ModuleDict(all_final_layer)
         self.noise_refiner = nn.ModuleList(
             [
-                ZImageTransformerBlock(
+                ZImageNoiseRefinerBlock(
                     1000 + layer_id,
                     dim,
                     n_heads,
@@ -844,7 +941,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         )
         self.context_refiner = nn.ModuleList(
             [
-                ZImageTransformerBlock(
+                ZImageContextRefinerBlock(
                     layer_id,
                     dim,
                     n_heads,
@@ -898,6 +995,13 @@ class ZImageTransformer2DModel(CachedTransformer):
         self.axes_lens = axes_lens
 
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
+        # Parameter-free split boundaries. Their outputs are sharded for every
+        # layer in the matching refiner group, then gathered at the last layer.
+        self.noise_refiner_sequence = _RefinerSequence()
+        self.noise_refiner_gather = _RefinerSequence()
+        self.context_refiner_sequence = _RefinerSequence()
+        self.context_refiner_gather = _RefinerSequence()
+        self._sp_plan = {**self._sp_plan, **_zimage_refiner_sp_plan(n_refiner_layers)}
 
         # UnifiedPrepare module for combining x and cap tensors
         # This enables _cp_plan to shard outputs via split_output=True
@@ -1109,8 +1213,10 @@ class ZImageTransformer2DModel(CachedTransformer):
             if self.alignment_padding_mode == ZERO_MASKED_PADDING:
                 x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
 
+        x, x_attn_mask, x_cos, x_sin = self.noise_refiner_sequence(x, x_attn_mask, x_cos, x_sin)
         for layer in self.noise_refiner:
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
+        x, x_attn_mask, x_cos, x_sin = self.noise_refiner_gather(x, x_attn_mask, x_cos, x_sin)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
@@ -1152,8 +1258,14 @@ class ZImageTransformer2DModel(CachedTransformer):
             if self.alignment_padding_mode == ZERO_MASKED_PADDING:
                 cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
 
+        cap_feats, cap_attn_mask, cap_cos, cap_sin = self.context_refiner_sequence(
+            cap_feats, cap_attn_mask, cap_cos, cap_sin
+        )
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
+        cap_feats, cap_attn_mask, cap_cos, cap_sin = self.context_refiner_gather(
+            cap_feats, cap_attn_mask, cap_cos, cap_sin
+        )
 
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
