@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
     )
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -50,15 +51,52 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
+_FUSED_QK_NORM_ROPE_MIN_TOKENS = 2048
 
 LEARNED_PADDING = "learned"
 ZERO_MASKED_PADDING = "zero_masked"
 logger = init_logger(__name__)
+
+
+def _pad_zimage_attention_heads(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    ulysses_degree: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pad Q/K/V heads to a Ulysses-compatible count.
+
+    Z-Image has 30 heads by default, while the common Ulysses degree is 8.
+    The padded heads are transport-only and must be removed from the attention
+    output before the output projection.
+    """
+    original_head_count = query.shape[2]
+    head_pad = (-original_head_count) % ulysses_degree if ulysses_degree > 1 else 0
+    if head_pad == 0:
+        return query, key, value, original_head_count
+
+    query = torch.cat(
+        [query, query.new_zeros((*query.shape[:2], head_pad, query.shape[3]))],
+        dim=2,
+    )
+    key = torch.cat(
+        [key, key.new_zeros((*key.shape[:2], head_pad, key.shape[3]))],
+        dim=2,
+    )
+    value = torch.cat(
+        [value, value.new_zeros((*value.shape[:2], head_pad, value.shape[3]))],
+        dim=2,
+    )
+    return query, key, value, original_head_count
 
 
 class UnifiedPrepare(nn.Module):
@@ -339,13 +377,51 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
-        # Cast to correct dtype
+        # Z-Image uses adjacent-pair RoPE with 64 rotary pairs. Flattening
+        # batch/sequence gives the shared fused Q/K RMSNorm + RoPE kernel the
+        # [tokens, heads, head_dim] contract while preserving the original
+        # [batch, sequence, heads, head_dim] layout at the attention boundary.
         dtype = query.dtype
+        token_count = query.shape[0] * query.shape[1]
+        if token_count >= fused_qk_norm_rope_min_tokens(_FUSED_QK_NORM_ROPE_MIN_TOKENS):
+            rope_table = torch.cat((cos, sin), dim=-1).reshape(token_count, -1)
+            fused_query, fused_key = fused_qk_norm_rope(
+                query.reshape(token_count, query.shape[2], query.shape[3]),
+                key.reshape(token_count, key.shape[2], key.shape[3]),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                rope_table,
+                self.norm_q.variance_epsilon,
+                head_dim=query.shape[-1],
+                rotary_dim=rope_table.shape[-1],
+                interleaved=True,
+            )
+            query = fused_query.reshape_as(query)
+            key = fused_key.reshape_as(key)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+            query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         query, key = query.to(dtype), key.to(dtype)
+
+        # Z-Image has 30 heads, which is not divisible by the default
+        # Ulysses degree of 8. xDiT pads to the next Ulysses-compatible head
+        # count before its exchange. Do the same here so strict Ulysses can
+        # use fixed shapes instead of advanced UAA's per-attention length
+        # collectives. The padded heads are discarded immediately after
+        # attention and do not change the projected output shape.
+        ulysses_degree = 1
+        if is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            if od_config is not None and od_config.parallel_config is not None:
+                ulysses_degree = int(od_config.parallel_config.ulysses_degree)
+        query, key, value, original_head_count = _pad_zimage_attention_heads(
+            query,
+            key,
+            value,
+            ulysses_degree,
+        )
+        head_pad = query.shape[2] - original_head_count
 
         # From [batch, seq_len] to [batch, 1, 1, seq_len] -> broadcast to [batch, heads, seq_len, seq_len]
         if attention_mask is not None and attention_mask.ndim == 2:
@@ -356,10 +432,13 @@ class ZImageAttention(nn.Module):
             query,
             key,
             value,
+            AttentionMetadata(combine_qkv_a2a=True),
             # attn_mask=attention_mask, # we don't support multi prompts now.
         )
 
         # Reshape back
+        if head_pad:
+            hidden_states = hidden_states[:, :, :original_head_count, :]
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
 
@@ -649,10 +728,10 @@ class ZImageTransformer2DModel(CachedTransformer):
         # Shard unified_prepare outputs (similar to Wan's rope module)
         # This shards all 4 return values: unified, unified_cos, unified_sin, unified_attn_mask
         "unified_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified
-            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_cos
-            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_sin
-            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True),  # unified_attn_mask
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # unified
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # unified_cos
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # unified_sin
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),  # unified_attn_mask
         },
         # Gather output at final_layer (default: patch_size=2, f_patch_size=1)
         "all_final_layer.2-1": SequenceParallelOutput(gather_dim=1, expected_dims=3),
