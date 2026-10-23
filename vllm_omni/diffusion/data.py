@@ -2313,15 +2313,9 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {
-            "backend",
-            "skip_softmax",
-            "quant",
-            "fastvideo_vsa_topk",
-            "fastvideo_vsa_provider",
-            "fastvideo_vsa_precision",
-            "block_sparse",
-        }
+        # Derived from the dataclass so a new AttentionSpec field is never
+        # mistaken for a nested role key.
+        spec_keys = {f.name for f in fields(AttentionSpec)}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

@@ -249,6 +249,16 @@ class TestAttentionConfig:
             "topk": 32,
         }
 
+    @pytest.mark.parametrize("fmt", ["bf16", "fp8"])
+    def test_aiter_quant_in_per_role_mapping(self, fmt):
+        config = AttentionConfig(
+            default={"backend": "AITER_QUANT_ATTN", "aiter_quant": {"format": "mxfp6"}},
+            per_role={"cross": {"backend": "AITER_QUANT_ATTN", "aiter_quant": {"format": fmt}}},
+        )
+        assert config.default.aiter_quant.format == "mxfp6"
+        assert config.per_role["cross"].aiter_quant.format == fmt
+        assert config.per_role["cross"].backend_kwargs() == {"format": fmt}
+
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
             default={"backend": "auto"},
