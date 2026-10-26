@@ -720,11 +720,14 @@ class _StubPipeline(nn.Module):
         self.vae = vae
 
 
+@pytest.mark.parametrize("is_cuda", [True, False], ids=["cuda", "rocm"])
 @pytest.mark.parametrize(("level", "expected"), [("lossless", True), ("channels_last", True), ("off", False)])
-def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: bool) -> None:
-    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+def test_registry_hook_installs_on_cuda_and_rocm_platforms(mocker, level: str, expected: bool, is_cuda: bool) -> None:
+    # The Wan2.1-style (non-residual) VAE is verified on both platforms.
+    _, vae = _build_pair(TINY_WAN21, torch.float32)
     platform = mocker.Mock()
-    platform.is_cuda.return_value = True
+    platform.is_cuda.return_value = is_cuda
+    platform.is_rocm.return_value = not is_cuda
     mocker.patch.object(registry_module, "current_omni_platform", platform)
 
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
@@ -733,10 +736,26 @@ def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: b
         assert getattr(vae, REPORT_ATTR).level == level
 
 
-def test_registry_hook_skips_non_cuda_platform_and_non_wan_vaes(mocker) -> None:
+def test_registry_hook_skips_residual_vaes_on_rocm_only(mocker) -> None:
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = False
+    platform.is_rocm.return_value = True
+    mocker.patch.object(registry_module, "current_omni_platform", platform)
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
+    assert not is_installed(vae)
+
+    platform.is_cuda.return_value = True
+    platform.is_rocm.return_value = False
+    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
+    assert is_installed(vae)
+
+
+def test_registry_hook_skips_other_platforms_and_non_wan_vaes(mocker) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
     platform.is_cuda.return_value = False
+    platform.is_rocm.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
     assert not is_installed(vae)
