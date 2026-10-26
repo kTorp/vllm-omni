@@ -535,14 +535,18 @@ def _register_rocm_mxfp4_op() -> None:
     ) -> torch.Tensor:
         quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
         a_quant, a_scale = quant_func(a, shuffle=True)
-        return aiter.gemm_a4w4(
+        # aiter.gemm_a4w4 does not apply ``bias`` reliably: the tuned CK path ignores it and the
+        # asm path expects an fp32 [1, N] tensor. Add it after the GEMM, as xDiT does.
+        out = aiter.gemm_a4w4(
             a_quant,
             w_quant,
             a_scale,
             w_scale,
             bpreshuffle=True,
-            bias=bias,
         )
+        if bias is not None:
+            out = out + bias.to(out.dtype)
+        return out
 
     @_rocm_mxfp4_gemm.register_fake
     def _rocm_mxfp4_gemm_fake(
