@@ -396,6 +396,19 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
+                # xDiT base_model._enable_compute_comm_overlap. Torch 2.13
+                # leaves the pass list empty, so the flag alone does nothing.
+                # Compile mode and granularity are left as configured.
+                torch._inductor.config.reorder_for_compute_comm_overlap = True
+                torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+                    "reorder_compute_for_overlap",
+                    "sink_waits",
+                    "raise_comms",
+                ]
+                logger.info(
+                    "Model runner: Inductor reorder_for_compute_comm_overlap enabled with passes %s.",
+                    list(torch._inductor.config.reorder_for_compute_comm_overlap_passes),
+                )
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
                         self.pipeline.setup_compile()
