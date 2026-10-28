@@ -544,17 +544,15 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA and ROCm (HIP) are supported;
-    other platforms keep the reference implementation. Failures never abort
-    model loading.
+    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
+    keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
     if level == "off" and encode_level == "off":
         return
-    is_cuda = current_omni_platform.is_cuda()
-    if not (is_cuda or current_omni_platform.is_rocm()):
-        logger.debug("Wan VAE fast path is only supported on CUDA and ROCm; skipping")
+    if not current_omni_platform.is_cuda():
+        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
@@ -576,12 +574,6 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
 
     for name, vae in candidates:
         if not isinstance(vae, AutoencoderKLWan):
-            continue
-        if not is_cuda and getattr(vae.config, "is_residual", False):
-            # Residual (Wan2.2 TI2V-5B style) VAEs are not bit-exact on ROCm yet: the lossless
-            # parity tests fail in bf16/fp16 when the time-concatenation kernel is used. The
-            # Wan2.1-style VAE of the A14B models is bit-exact on gfx950.
-            logger.info("Wan VAE fast path skipped on %s: residual VAEs are not verified on ROCm", name)
             continue
         for component, component_level, install in (
             ("decoder", level, install_wan_vae_fastpath),
